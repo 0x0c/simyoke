@@ -94,9 +94,11 @@ def _allowed_repositories(body: dict[str, Any]) -> tuple[list[Any] | None, str |
 def list_orgs_view(state: ServeState, *, actor: str | None = None) -> tuple[Any, int]:  # noqa: ARG001  # uniform operation signature
     """Every live org with its membership — the Orgs page's list and the source its edit form fills.
 
-    The rosters themselves, not just their sizes: the membership form replaces all four fields as
-    one unit, so it has to start from the current values or the first save would silently empty
-    what it never showed. Only an admin can reach this (`authz.required_role`), which is the same
+    The rosters themselves, not just their sizes: the membership form replaces the four human
+    fields as one unit, so it has to start from the current values or the first save would silently
+    empty what it never showed. `allowedRepositories` travels with them but is the exception —
+    omitting it on a save leaves it alone (BE-0414 unit 2), so a client that never showed it cannot
+    strip it. Only an admin can reach this (`authz.required_role`), which is the same
     tier that could already read the `orgs:` block through `GET /api/config/content`.
     """
     if state.repository is None:

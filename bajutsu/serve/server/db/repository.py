@@ -140,9 +140,10 @@ class Repository(Protocol):
 
         The single-use rule behind the OIDC exchange, in the shared system of record rather than
         in a process: a hosted control plane runs several replicas over one database, and a
-        per-process cache would let a captured token be replayed against a second replica. A row
-        already past *expires_at* is not treated as spent — the token it named is refused on its
-        own lifetime by then — so the table stays bounded without a sweep of its own.
+        per-process cache would let a captured token be replayed against a second replica. A row is
+        swept only once it is past *expires_at* by more than the clock skew the lifetime checks
+        allow, since a token inside that window is still acceptable and must still be refused here
+        — so the table stays bounded with no schedule of its own.
         """
 
     def soft_delete_org(self, org_id: str, *, at: datetime) -> bool:

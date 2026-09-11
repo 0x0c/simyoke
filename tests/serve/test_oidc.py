@@ -597,3 +597,63 @@ def test_an_empty_provider_variable_takes_the_default_rather_than_failing_the_bo
     config = _oidc_from_env()
     assert config is not None
     assert config.provider is GITHUB_ACTIONS
+
+
+def test_the_real_fetch_returns_the_body_and_re_checks_the_served_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_fetch_url`'s own logic, without reaching anything: build the request, read it through the
+    HTTPS-only opener, re-check the URL actually served, hand back the bytes. Exercised against a
+    stubbed opener rather than a live server, because the suite's offline promise is the point —
+    the opener's *wiring* is asserted separately."""
+    from bajutsu.serve import oidc as module
+
+    class _Response:
+        def __init__(self, url: str, body: bytes) -> None:
+            self.url = url
+            self._body = body
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    served: list[str] = []
+
+    def _open(request: Any, timeout: float | None = None) -> _Response:
+        served.append(request.full_url)
+        assert request.get_header("Accept") == "application/json"
+        assert timeout is not None, "an unresponsive issuer must not hold a worker thread open"
+        return _Response("https://token.example.com/keys", b'{"keys": []}')
+
+    monkeypatch.setattr(module._opener, "open", _open)
+    assert module._fetch_url("https://token.example.com/keys") == b'{"keys": []}'
+    assert served == ["https://token.example.com/keys"]
+
+
+def test_the_real_fetch_refuses_a_body_served_over_plain_http(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The belt-and-braces half: even past the redirect handler, a response that arrived over
+    plain HTTP is not read as a key set."""
+    from bajutsu.serve import oidc as module
+
+    class _Response:
+        url = "http://token.example.com/keys"
+
+        def read(self) -> bytes:  # pragma: no cover - the scheme check fires first
+            raise AssertionError("the body must not be read from a plain-HTTP response")
+
+        def __enter__(self) -> _Response:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(module._opener, "open", lambda *_a, **_k: _Response())
+    with pytest.raises(OidcError, match="HTTPS"):
+        module._fetch_url("https://token.example.com/keys")

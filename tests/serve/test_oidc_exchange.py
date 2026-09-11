@@ -512,14 +512,19 @@ def test_a_machine_session_posting_a_body_is_refused_and_the_connection_stays_us
 
 
 def test_the_key_set_cache_is_built_once_and_kept(
-    serve_engine: Callable[..., Engine], tmp_path: Path
+    serve_engine: Callable[..., Engine], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Held on the state, not rebuilt per call: a fresh cache per exchange would fetch the issuer's
     keys every time and make the refresh floor bound nothing."""
     key = _key()
     state = _state(serve_engine, tmp_path, key)
+    # `JwksCache.__init__` resolves `_fetch_url` at construction, so stubbing the module attribute
+    # is what keeps the cold-start path in-process. Without it this is the one case in the file
+    # that reaches the real issuer — and the outcome would then depend on whether the sandbox has
+    # network, which is why the assertion can be exact only once the fetch is stubbed.
+    monkeypatch.setattr("bajutsu.serve.oidc._fetch_url", _fetch_for(key))
     state.oidc_keys = None  # the real cold-start path, which pre-seeding otherwise hides
-    assert ops.oidc_exchange(state, _token(key, jti="one"), "acme")[1] in (200, 403)
+    assert ops.oidc_exchange(state, _token(key, jti="one"), "acme")[1] == 200
     first = state.oidc_keys
     assert first is not None
     ops.oidc_exchange(state, _token(key, jti="two"), "acme")
