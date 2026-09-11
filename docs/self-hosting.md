@@ -576,10 +576,11 @@ Three hazards worth reading before you list a repository:
 - **Whoever can merge a workflow can mint a token.** `allowedRepositories: [acme/app]` means
   "whoever can write that repository's workflows may act as this org". Narrow by `environment` when
   that is too broad — a GitHub Environment can require reviewers before the job runs.
-- **Fork pull requests.** A fork's pull request does not get `id-token: write` by default, but a
-  `pull_request_target` workflow runs in the base repository's context and can, as does a repository
-  setting that sends write tokens to fork pull requests. Narrow such a repository by `environment`
-  so no token is ever minted from a run an outside contributor influenced.
+- **Fork pull requests.** A fork's pull request does not get `id-token: write` by default. A
+  `pull_request_target` workflow does, because it runs in the base repository's context, and so
+  does any workflow in a repository configured to send write tokens to fork pull requests. Narrow
+  such a repository by `environment` so no token is ever minted from a run an outside contributor
+  influenced.
 
 Finally, a machine session is **revocable in principle** where a GitHub-issued token is not:
 every session a repository mints carries the identity `repo:<owner>/<repo>`, which is what a
