@@ -422,7 +422,10 @@ admin's back. A configuration bound afterwards through the web UI or `POST /api/
 copies at all, whatever its `orgs:` block says.
 An admin edits the membership from the Orgs page from then on, and an edit to those five fields
 here has no effect: `serve` records a warning naming the org whose entry still declares them, so an
-operator learns the file stopped deciding rather than watching an edit vanish. `targets` is the
+operator learns the file stopped deciding rather than watching an edit vanish.
+`allowedRepositories` is the one of the five the Orgs page does not show — it is edited through
+`POST /api/orgs/<slug>/membership` instead, and a save from that page leaves it untouched rather
+than clearing it. `targets` is the
 field that keeps working, so an entry pared down to `targets:` alone is the expected end state on
 such a deployment. Paring an entry down before that first boot is safe too, since the order is not
 yours to get wrong: an entry declaring only `targets` is skipped rather than copied, so it never

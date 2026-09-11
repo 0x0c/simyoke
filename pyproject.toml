@@ -355,7 +355,7 @@ forbidden_modules = [
 ]
 
 # The deterministic core must also stay free of the hosting-only third-party extras (BE-0129): the
-# `db` (SQLAlchemy/Alembic/psycopg/cryptography) and `oauth` (Authlib) stacks belong to
+# `db` (SQLAlchemy/Alembic/psycopg/cryptography) and `oauth` (Authlib, joserfc) stacks belong to
 # `bajutsu/serve/` alone. The periphery contract above already keeps the core off `bajutsu.serve`;
 # this forbids a core module from reaching the extras *directly*, which the internal layer graph
 # can't express — so `include_external_packages` lets import-linter see the external import. The
@@ -374,6 +374,7 @@ forbidden_modules = [
     "alembic",
     "psycopg",
     "authlib",
+    "joserfc",
     "cryptography",
 ]
 

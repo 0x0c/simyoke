@@ -19,8 +19,9 @@ class OidcJti(Base):
     bound. It costs one write per job, since a token is exchanged once and every later call in the
     pipeline presents the minted session instead.
 
-    `expires_at` is the presented token's own `exp`: past it the token is refused on its lifetime
-    anyway, so the row has nothing left to protect and the next exchange sweeps it.
+    `expires_at` is the presented token's own `exp`, but the row outlives it: the sweep in
+    `SqlRepository.spend_oidc_jti` deletes only past `exp` plus the clock skew the lifetime checks
+    allow, since a token inside that window is still acceptable and must still be refused here.
     """
 
     __tablename__ = "oidc_jti"

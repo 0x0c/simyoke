@@ -246,7 +246,7 @@ Three contracts are enforced:
   periphery module such as `record/`; likewise the resolved `ai` block (`AiConfig`) lives in
   `config/`, so the core reads it without importing the AI client.
 - **The core must stay host-agnostic (BE-0129).** Multi-tenant hosting concerns — organizations,
-  roles, tenancy — and the `db` (SQLAlchemy/Alembic/psycopg/cryptography) and `oauth` (Authlib)
+  roles, tenancy — and the `db` (SQLAlchemy/Alembic/psycopg/cryptography) and `oauth` (Authlib, joserfc)
   extras belong to `bajutsu/serve/` alone. The org model (`OrgConfig`, `org_for_*`,
   `targets_for_org`, `load_serve_config`) lives in `bajutsu/serve/orgs.py`, not `config/`; `Config`
   carries no `orgs` field, and the core loader drops a top-level `orgs:` before validation so a run
