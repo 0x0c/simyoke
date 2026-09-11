@@ -211,7 +211,11 @@ def _oidc_from_env() -> OidcConfig | None:
     audience = os.environ.get("BAJUTSU_OIDC_AUDIENCE")
     if not audience:
         return None
-    name = os.environ.get("BAJUTSU_OIDC_PROVIDER", GITHUB_ACTIONS.name)
+    # `or`, not a `get` default: `get` substitutes only when the variable is *absent*, so a
+    # blank `BAJUTSU_OIDC_PROVIDER=` — how a docker-compose entry or an unset Helm value
+    # arrives — would reach `PROVIDERS.get("")` and fail the boot telling the operator the
+    # value they deliberately left empty is wrong. Every sibling read here treats empty as unset.
+    name = os.environ.get("BAJUTSU_OIDC_PROVIDER") or GITHUB_ACTIONS.name
     provider = PROVIDERS.get(name)
     if provider is None:
         raise ValueError(f"BAJUTSU_OIDC_PROVIDER must be one of {sorted(PROVIDERS)}, got {name!r}")

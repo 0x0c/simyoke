@@ -581,3 +581,19 @@ def test_the_jwks_fetcher_reads_through_the_https_only_opener() -> None:
     `getattr`."""
     installed = getattr(_opener, "handlers", [])
     assert any(isinstance(handler, _HttpsOnlyRedirect) for handler in installed)
+
+
+def test_an_empty_provider_variable_takes_the_default_rather_than_failing_the_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`os.environ.get(name, default)` substitutes only when the variable is *absent*, so a blank
+    `BAJUTSU_OIDC_PROVIDER=` — a docker-compose entry or an unset Helm value — would otherwise
+    reach `PROVIDERS.get("")` and refuse to start, telling the operator the value they deliberately
+    left empty is wrong. Every sibling read here already treats empty as unset."""
+    from bajutsu.serve import _oidc_from_env
+
+    monkeypatch.setenv("BAJUTSU_OIDC_AUDIENCE", AUDIENCE)
+    monkeypatch.setenv("BAJUTSU_OIDC_PROVIDER", "")
+    config = _oidc_from_env()
+    assert config is not None
+    assert config.provider is GITHUB_ACTIONS

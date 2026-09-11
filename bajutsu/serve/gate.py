@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from bajutsu.serve.sessions import MACHINE, Principal
+from bajutsu.serve.sessions import Principal
 from bajutsu.serve.state import SessionManager
 
 # Standard hardening headers on every response (BE-0051): block MIME sniffing and cross-origin
@@ -148,18 +148,22 @@ def actor_for(auth: SessionManager, session_value: str | None) -> str | None:
     return auth.sessions.identity(session_value) if session_value else None
 
 
-def machine_principal(auth: SessionManager, session_value: str | None) -> Principal | None:
-    """This request's machine principal, or None when it is a human or token caller (BE-0414).
+def principal_for(auth: SessionManager, session_value: str | None) -> Principal | None:
+    """Who this request's session belongs to, in **one** read (BE-0414).
 
     A machine session authenticates exactly like a human one — `is_authorized` already accepts any
     valid session cookie — so the gate has to ask which it is holding before deciding *which* gate
     governs it. Reading the kind the store recorded, rather than the shape of the identity string,
     is what keeps a human session from ever reaching the machine branch.
+
+    The whole principal comes back rather than only a machine one, so a backend derives both the
+    kind and the identity from a single snapshot. Asking twice opened a window: between a
+    `machine_principal` read and a separate `actor_for` read, a session whose short time-to-live
+    crossed — or which a concurrent org retirement revoked — answers None to both, and a caller
+    that is neither machine nor human falls through to the identity-less shared-token shape, which
+    is full access. One read cannot disagree with itself that way.
     """
-    if not session_value:
-        return None
-    principal = auth.sessions.principal(session_value)
-    return principal if principal is not None and principal.kind == MACHINE else None
+    return auth.sessions.principal(session_value) if session_value else None
 
 
 def forbidden_for_machine(method: str, path: str) -> bool:  # noqa: ARG001 - see below

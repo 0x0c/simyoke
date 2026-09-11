@@ -598,3 +598,93 @@ def _get(port: int, path: str, *, cookie: str) -> tuple[int, dict[str, str], byt
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
+
+
+def test_the_gate_derives_identity_from_the_same_read_as_the_kind(tmp_path: Path) -> None:
+    """The kind and the identity must come from one snapshot of the session.
+
+    Asking separately let a session that stopped validating in between answer None to *both* —
+    neither machine nor human — and the request was then served as the identity-less shared-token
+    caller, which is full access. A human session refused by the role gate is what discriminates:
+    the old code reached `actor_for` -> `identity()` for the login after already reading the
+    principal, so a second read would show up here.
+    """
+    key = _key()
+    state = _state(_threaded(tmp_path), tmp_path, key)
+    assert state.repository is not None
+    # An editor, on an admin-only path: the request is refused inside the gate and never reaches a
+    # route handler, whose own `ctx.actor()` would otherwise read the identity legitimately and
+    # make the count say nothing about the gate.
+    state.repository.upsert_user(
+        "dana", org_id="acme", github_login="dana", email="dana@x", role="editor"
+    )
+    sid = state.auth.issue_session("dana")
+
+    reads: list[str] = []
+    inner = state.auth.sessions
+
+    class _Counting:
+        """Wraps the store so the gate's own reads are visible, without changing any answer."""
+
+        def __getattr__(self, name: str) -> Any:
+            attribute = getattr(inner, name)
+            if name not in ("principal", "identity", "valid"):
+                return attribute
+
+            def counted(*args: Any, **kwargs: Any) -> Any:
+                reads.append(name)
+                return attribute(*args, **kwargs)
+
+            return counted
+
+    state.auth.sessions = _Counting()
+    server, port = _serve(state)
+    try:
+        code, _headers, _body = _post(port, "/api/config", {"path": "x"}, cookie=sid)
+        assert code == 403, "an editor must be refused POST /api/config"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert reads.count("principal") == 1, reads
+    assert "identity" not in reads, reads
+
+
+def test_the_fastapi_gate_derives_identity_from_the_same_read_too(tmp_path: Path) -> None:
+    """The same single-snapshot rule on the hosted backend. Both gates route through `gate.py`, so
+    a divergence here is the failure BE-0253 put the policy there to prevent — and the human path
+    is the one an earlier review found asserted for only one backend."""
+    from fastapi.testclient import TestClient
+
+    from bajutsu.serve.server.app import make_app
+
+    key = _key()
+    state = _state(_threaded(tmp_path), tmp_path, key)
+    assert state.repository is not None
+    state.repository.upsert_user(
+        "dana", org_id="acme", github_login="dana", email="dana@x", role="editor"
+    )
+    sid = state.auth.issue_session("dana")
+
+    reads: list[str] = []
+    inner = state.auth.sessions
+
+    class _Counting:
+        def __getattr__(self, name: str) -> Any:
+            attribute = getattr(inner, name)
+            if name not in ("principal", "identity", "valid"):
+                return attribute
+
+            def counted(*args: Any, **kwargs: Any) -> Any:
+                reads.append(name)
+                return attribute(*args, **kwargs)
+
+            return counted
+
+    state.auth.sessions = _Counting()
+    client = TestClient(make_app(state))
+    client.cookies.set("bajutsu_session", sid)
+    assert client.post("/api/config", json={"path": "x"}).status_code == 403
+
+    assert reads.count("principal") == 1, reads
+    assert "identity" not in reads, reads

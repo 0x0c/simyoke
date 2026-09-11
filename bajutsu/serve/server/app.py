@@ -49,6 +49,7 @@ from bajutsu.serve.helpers import (
     valid_run_id,
 )
 from bajutsu.serve.routes import ROUTES, Handle, Route
+from bajutsu.serve.sessions import MACHINE
 from bajutsu.serve.state import ServeState
 from bajutsu.serve.upload_artifacts import ArtifactKind
 from bajutsu.serve.uploads import (
@@ -204,12 +205,18 @@ def make_app(state: ServeState) -> FastAPI:  # noqa: C901, PLR0915
             # Which of the three caller shapes is this? A machine session (BE-0414) carries an
             # identity like a human one, so its own gate runs first and unconditionally — the role
             # gate below would read it as a user with no row and default it to viewer.
-            machine = gate.machine_principal(state.auth, request.cookies.get(_SESSION_COOKIE))
-            if machine is not None and gate.forbidden_for_machine(method, path):
+            # One read, not two: asking separately for the kind and then the identity lets a
+            # session that stops validating in between answer None to both, and a caller that is
+            # neither machine nor human is served as the shared-token shape — full access.
+            principal = gate.principal_for(state.auth, request.cookies.get(_SESSION_COOKIE))
+            is_machine = principal is not None and principal.kind == MACHINE
+            if is_machine and gate.forbidden_for_machine(method, path):
                 return _hardened(JSONResponse({"error": "forbidden"}, status_code=403))
-            # Enforce the user's role on mutating endpoints for an OAuth session (an identity) when a
-            # database is wired (BE-0015 7c-2); token/Bearer has no identity and stays full-access.
-            login = None if machine is not None else _actor(request)
+            # Enforce the user's role on mutating endpoints for an OAuth session (an identity)
+            # when a database is wired (BE-0015 7c-2); token/Bearer has no identity and stays
+            # full-access. A machine principal never reaches that gate — the allowlist above is
+            # the whole of what governs it.
+            login = None if is_machine else (principal.identity if principal is not None else None)
             if (
                 login is not None
                 and state.repository is not None

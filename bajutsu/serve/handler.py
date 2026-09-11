@@ -30,6 +30,7 @@ from bajutsu.serve.helpers import (
     valid_run_id,
 )
 from bajutsu.serve.routes import ROUTES, match_route
+from bajutsu.serve.sessions import MACHINE
 from bajutsu.serve.state import ServeState
 from bajutsu.serve.upload_artifacts import ArtifactKind
 from bajutsu.serve.uploads import (
@@ -244,8 +245,12 @@ def _make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:  # noqa: C
                 # the role gate below and be read as a user with no row, i.e. a viewer. Its own
                 # gate runs first and unconditionally, with or without a database: the role gate's
                 # "DB-less = full access" would be exactly the wrong default to inherit here.
-                machine = gate.machine_principal(state.auth, self._session_value())
-                if machine is not None and gate.forbidden_for_machine(self.command, path):
+                # One read, not two: asking separately for the kind and then the identity lets a
+                # session that stops validating in between answer None to both, and a caller that
+                # is neither machine nor human is served as the shared-token shape — full access.
+                principal = gate.principal_for(state.auth, self._session_value())
+                is_machine = principal is not None and principal.kind == MACHINE
+                if is_machine and gate.forbidden_for_machine(self.command, path):
                     length = int(self.headers.get("Content-Length") or 0)
                     if length:
                         self.rfile.read(length)
@@ -253,8 +258,11 @@ def _make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:  # noqa: C
                     return False
                 # For an OAuth session (an identity) with a database wired, enforce the user's role
                 # on mutating endpoints (BE-0015 7c-2). A token/Bearer request has no identity and
-                # stays full-access (the operator credential).
-                login = None if machine is not None else self._actor()
+                # stays full-access (the operator credential). A machine principal never reaches
+                # that gate — the allowlist above is the whole of what governs it.
+                login = (
+                    None if is_machine else (principal.identity if principal is not None else None)
+                )
                 if (
                     login is not None
                     and state.repository is not None
