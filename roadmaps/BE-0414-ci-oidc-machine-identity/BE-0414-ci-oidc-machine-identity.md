@@ -9,6 +9,7 @@
 | Author | [@paihu](https://github.com/paihu) |
 | Status | **In progress** |
 | Tracking issue | [Search](https://github.com/bajutsu-e2e/bajutsu/issues?q=is%3Aissue+label%3Aroadmap-tracking+in%3Atitle+"BE-0414") |
+| Implementing PR | [#1986](https://github.com/bajutsu-e2e/bajutsu/pull/1986) (units 1-2) |
 | Topic | Hosting the web UI |
 | Related | [BE-0313](../BE-0313-github-org-team-rbac/BE-0313-github-org-team-rbac.md), [BE-0051](../BE-0051-serve-hardening-for-hosting/BE-0051-serve-hardening-for-hosting.md), [BE-0015](../BE-0015-web-ui-public-hosting/BE-0015-web-ui-public-hosting.md) |
 <!-- /BE-METADATA -->
@@ -483,6 +484,35 @@ serve configuration.
       the machine sessions bound to the retired org.
 - [ ] Unit 4 — Tests for each seam, including the cross-replica `jti` replay test, the DB-less
       exchange refusal, and the import-guard check for `joserfc`, and the self-hosting documentation.
+
+Log:
+
+- [#1986](https://github.com/bajutsu-e2e/bajutsu/pull/1986) — Units 1 and 2. Added
+  `POST /api/oidc/exchange` and the verification behind it (`bajutsu/serve/oidc.py`): JWKS
+  discovery with a bounded-refresh cache, a pinned RS256 allowlist, issuer / audience / lifetime
+  with a 60s skew, a serve-side age ceiling, mandatory `iat` and `jti`, and a single-use `jti`
+  spent through the `Repository` seam so replay is refused across replicas. `SessionStore` gained
+  a per-session expiry, an org and a principal kind across all three implementations, plus a
+  `Principal` read narrowed in one place. Added `allowedRepositories` on `OrgConfig` with
+  exact-equality matching on the discrete claims and optional per-entry `environment` / `ref` /
+  `workflowRef` bounds. Alembic revision 0020 carries the two session columns, the org column and
+  the `oidc_jti` table.
+
+  Three deviations from this item's text, each because the literal reading does not work.
+  `allowedRepositories` needed a database column as well as the config field, since a DB-backed
+  deployment reads its org model from `orgs_from_db` and the exchange requires a database — a
+  config-only field would be empty on exactly the deployments that can use it. The route was added
+  to `gate.is_open` here rather than in unit 3, or unit 1 would be unreachable and untestable.
+  And instead of refusing the exchange on a store that cannot enforce a per-session expiry,
+  `InMemorySessionStore` gained one; the database requirement reaches the same narrowing with less
+  code. The per-entry bound is spelled `workflowRef` rather than `job_workflow_ref`, matching the
+  camelCase of the other config keys and staying provider-neutral.
+
+  Verification is provider-independent: `OidcProvider` is a table of claim names, so a second CI
+  platform is one entry rather than a redesign. Units 3 and 4 remain, so a minted machine session
+  is refused on every endpoint for now — `gate.forbidden_for_machine` is the single seam unit 3
+  replaces, and the deny-all is what keeps a machine session out of the role gate's viewer default
+  in the meantime.
 
 ## References
 
