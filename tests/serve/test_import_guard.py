@@ -27,6 +27,7 @@ FORBIDDEN = sorted(
         "sqlalchemy",
         "alembic",
         "authlib",
+        "joserfc",
         "boto3",
         "psycopg",
         "playwright",

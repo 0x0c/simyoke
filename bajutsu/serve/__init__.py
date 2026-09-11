@@ -65,6 +65,7 @@ from bajutsu.serve.helpers import (
 from bajutsu.serve.jobs import cancel_job, run_job
 from bajutsu.serve.launchagent import launchagent_plist
 from bajutsu.serve.logbus import InMemoryLogBus, LogBus
+from bajutsu.serve.oidc import GITHUB_ACTIONS, PROVIDERS, OidcConfig
 from bajutsu.serve.operations.config import (
     restore_org_binding,
     restore_persisted_provider_settings,
@@ -192,6 +193,68 @@ def _run_retention_from_env(raw: str | None) -> int:
         raise ValueError(
             f"BAJUTSU_RUN_RETENTION_DAYS must be a whole number of days, got {raw!r}"
         ) from None
+
+
+_DEFAULT_OIDC_MAX_TOKEN_AGE = 300  # seconds since `iat` past which a token is refused
+_DEFAULT_OIDC_SESSION_TTL = 900  # seconds a machine session lives, capped by the token's `exp`
+
+
+def _oidc_from_env() -> OidcConfig | None:
+    """The deployment's OIDC settings, or None when it configures no expected audience (BE-0414).
+
+    The audience is the one check an operator must not skip: a workflow chooses its own, so a
+    deployment accepting any would accept a token minted for an unrelated service. Unset therefore
+    disables the whole caller shape rather than defaulting to "accept whatever arrives" — the
+    endpoint is not even opened (`gate.is_open`). The issuer defaults to the selected provider's
+    own and is overridable for a self-hosted installation (GitHub Enterprise Server).
+    """
+    audience = os.environ.get("BAJUTSU_OIDC_AUDIENCE")
+    if not audience:
+        return None
+    name = os.environ.get("BAJUTSU_OIDC_PROVIDER", GITHUB_ACTIONS.name)
+    provider = PROVIDERS.get(name)
+    if provider is None:
+        raise ValueError(f"BAJUTSU_OIDC_PROVIDER must be one of {sorted(PROVIDERS)}, got {name!r}")
+    return OidcConfig(
+        provider=provider,
+        audience=audience,
+        issuer=os.environ.get("BAJUTSU_OIDC_ISSUER") or provider.issuer,
+        max_token_age=_positive_seconds_from_env(
+            "BAJUTSU_OIDC_MAX_TOKEN_AGE", _DEFAULT_OIDC_MAX_TOKEN_AGE
+        ),
+        session_ttl=_positive_seconds_from_env(
+            "BAJUTSU_OIDC_SESSION_TTL", _DEFAULT_OIDC_SESSION_TTL
+        ),
+    )
+
+
+def _positive_seconds_from_env(var: str, default: int) -> int:
+    """A positive whole number of seconds from *var* — the same defensive parse, and the same
+    variable-naming error, the other operator-facing duration knobs above get."""
+    raw = os.environ.get(var)
+    if not raw:
+        return default
+    try:
+        seconds = int(raw)
+    except ValueError:
+        raise ValueError(f"{var} must be a whole number of seconds, got {raw!r}") from None
+    if seconds <= 0:
+        raise ValueError(f"{var} must be a positive number of seconds, got {seconds}")
+    return seconds
+
+
+def _joserfc_installed() -> bool:
+    """Whether the JOSE library the OIDC exchange verifies with is importable (BE-0414).
+
+    Checked without importing it, so the boot-time probe does not itself pull an `oauth`-extra
+    dependency onto the default path the import guard protects.
+    """
+    from importlib.util import find_spec
+
+    try:
+        return find_spec("joserfc") is not None
+    except (ImportError, ValueError):  # a partially-installed or shadowed package
+        return False
 
 
 class MissingServerExtra(ImportError):
@@ -449,6 +512,27 @@ def _build_server_state(
         _warn("admin_teams_malformed", msg)
 
     repo = repository_from_env()
+    # A CI job's own credential (BE-0414): wired only when an expected audience is configured, and
+    # useless without a database, since the exchange spends each token's `jti` in the shared
+    # system of record. Warn rather than fail — a deployment may be mid-setup — but say plainly
+    # that the endpoint will refuse every exchange until the database is there.
+    oidc = _oidc_from_env()
+    if oidc is not None and _db_engine is None:
+        _warn(
+            "oidc_without_database",
+            "BAJUTSU_OIDC_AUDIENCE is set but no BAJUTSU_DATABASE_URL is — the OIDC exchange "
+            "spends each token's 'jti' in the database to make it single-use across replicas, so "
+            "every exchange will be refused until one is configured",
+        )
+    if oidc is not None and not _joserfc_installed():
+        # Verification imports `joserfc` lazily, so a deployment missing the extra would otherwise
+        # discover it as a 500 per exchange with no `oidc.denied` behind it. Say it once at boot,
+        # where an operator is looking, rather than once per pipeline run where nobody is.
+        _warn(
+            "oidc_without_joserfc",
+            "BAJUTSU_OIDC_AUDIENCE is set but 'joserfc' is not installed — it ships with the "
+            "'oauth' extra (`uv sync --extra oauth`), and without it every OIDC exchange fails",
+        )
 
     state = ServeState(
         runs_dir=runs_dir,
@@ -506,6 +590,7 @@ def _build_server_state(
             ),
             oauth=oauth,
             oauth_admin_teams=oauth_admin_teams,
+            oidc=oidc,
         ),
         startup_warnings=tuple(startup_warnings),
     )

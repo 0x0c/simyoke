@@ -361,8 +361,19 @@ orgs:
     githubOrgs: [acme-gh]                    # everyone in this GitHub org (needs the read:org OAuth scope)
     githubTeams: [acme-gh/qa]                # direct members of these Teams, without the whole GitHub org
     editorTeams: [acme-gh/scenario-maintainers] # direct members of these Teams become editors — and may sign in
+    allowedRepositories: [acme/app]          # CI jobs in these repositories may act as this org
     targets: [demo, checkout]
 ```
+
+`allowedRepositories` is the org's **machine** roster, beside the human ones
+([BE-0414](../roadmaps/BE-0414-ci-oidc-machine-identity/BE-0414-ci-oidc-machine-identity.md)): the
+repositories whose continuous-integration (CI) jobs may exchange an OpenID Connect (OIDC) token for
+a short-lived session acting as this org. It grants no role — a pipeline is governed by its own
+endpoint allowlist, never by viewer / editor / admin. An entry is the bare `"<owner>/<repo>"` name,
+or an object carrying that name plus an `environment`, `ref`, or `workflowRef` bound that narrows it
+further. Setting it up — the audience an operator must configure, the exchange endpoint, and the
+name-recycling and fork hazards — is covered in
+[Self-hosting](self-hosting.md#authenticating-a-ci-job-optional-be-0414).
 
 At OAuth login users are assigned their org — an explicit `members` entry first, then a `githubOrgs`
 match from their GitHub org memberships, then a `githubTeams` or `editorTeams` match from their direct
@@ -399,17 +410,17 @@ a deployment relying on that recovery should avoid declaring a real org named `d
 recovering admin's user row, audit entries, and object-storage prefix land inside that tenant instead
 of a neutral catch-all.
 
-**A deployment with a database reads four of these five fields only once**
+**A deployment with a database reads five of these six fields only once**
 ([BE-0375](../roadmaps/BE-0375-serve-org-lifecycle-management/BE-0375-serve-org-lifecycle-management.md)).
 On the one boot that finds the `orgs` table still empty, `serve` copies each org's `members`,
-`githubOrgs`, `githubTeams`, and `editorTeams` into it from the configuration this server was
-**launched** with;
+`githubOrgs`, `githubTeams`, `editorTeams`, and `allowedRepositories` into it from the
+configuration this server was **launched** with;
 every sign-in after that resolves against the database alone. That copy happens once for the life of
 the deployment: a boot that finds any org already there — a retired one included — copies nothing,
 so no later configuration edit, and no restart carrying one, can add or reshape a tenant behind an
 admin's back. A configuration bound afterwards through the web UI or `POST /api/config` never
 copies at all, whatever its `orgs:` block says.
-An admin edits the membership from the Orgs page from then on, and an edit to those four fields
+An admin edits the membership from the Orgs page from then on, and an edit to those five fields
 here has no effect: `serve` records a warning naming the org whose entry still declares them, so an
 operator learns the file stopped deciding rather than watching an edit vanish. `targets` is the
 field that keeps working, so an entry pared down to `targets:` alone is the expected end state on

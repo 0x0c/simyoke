@@ -7,7 +7,7 @@
 |---|---|
 | 提案 | [BE-0414](BE-0414-ci-oidc-machine-identity-ja.md) |
 | 提案者 | [@paihu](https://github.com/paihu) |
-| 状態 | **提案** |
+| 状態 | **実装中** |
 | トラッキング Issue | [検索](https://github.com/bajutsu-e2e/bajutsu/issues?q=is%3Aissue+label%3Aroadmap-tracking+in%3Atitle+"BE-0414") |
 | トピック | Web UI のホスティング |
 | 関連 | [BE-0313](../BE-0313-github-org-team-rbac/BE-0313-github-org-team-rbac-ja.md)、[BE-0051](../BE-0051-serve-hardening-for-hosting/BE-0051-serve-hardening-for-hosting-ja.md)、[BE-0015](../BE-0015-web-ui-public-hosting/BE-0015-web-ui-public-hosting-ja.md) |
@@ -493,7 +493,7 @@ nullを許すforeign keyです（`bajutsu/serve/server/models/audit_log.py`）�
 > 作業分解（作業の単位ごとに 1 つ）に対応し、ログには変更内容と時期（古い順）を PR へのリンクと
 > ともに記録します。
 
-- [ ] 単位1 — `POST /api/oidc/exchange`でトークンを機械セッションに交換します。発行者・`kid`の
+- [x] 単位1 — `POST /api/oidc/exchange`でトークンを機械セッションに交換します。発行者・`kid`の
       更新頻度を抑えたキャッシュ付きJWKS・RS256に固定したアルゴリズムの許可リスト・デプロイが設定
       する`aud`（未設定なら閉じる方向で失敗）・有効期間を検証します。`Repository`という接続点を
       通じてレプリカ間で共有する`jti`再送防止（`jti`を持たないトークンの拒否を含む）、
@@ -502,7 +502,7 @@ nullを許すforeign keyです（`bajutsu/serve/server/models/audit_log.py`）�
       テーブルのためのAlembicのrevision、`oauth` extraへ直接宣言
       する`joserfc`、そして`gate.py`を汚さないよう専用の遅延importモジュールに保つその検証を含み
       ます。
-- [ ] 単位2 — `OrgConfig`への`allowedRepositories`。交換のリクエストが名指したorgについて、個別の
+- [x] 単位2 — `OrgConfig`への`allowedRepositories`。交換のリクエストが名指したorgについて、個別の
       クレームで照合します。任意で項目ごとの`environment`/`ref`/`job_workflow_ref`により絞り込みます
       （`environment`はクレームがない場合も拒否）。
 - [ ] 単位3 — 機械セッション（身元は`repo:<owner>/<repo>`で取り消し可能）と、

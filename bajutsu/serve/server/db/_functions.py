@@ -30,6 +30,7 @@ def _to_org(row: Org) -> OrgRecord:
         github_orgs=list(row.github_orgs or []),
         github_teams=list(row.github_teams or []),
         editor_teams=list(row.editor_teams or []),
+        allowed_repositories=list(row.allowed_repositories or []),
         membership_seeded_at=row.membership_seeded_at,
         deleted_at=row.deleted_at,
         created_at=row.created_at,

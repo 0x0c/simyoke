@@ -54,7 +54,10 @@ server = ["fastapi>=0.110", "uvicorn>=0.27", "boto3>=1.34"]
 db = ["sqlalchemy>=2.0", "alembic>=1.13", "psycopg[binary]>=3.1", "cryptography>=50.0.0"]
 # GitHub OAuth login for the hosted control plane (BE-0015 7b-2). Imported only when OAuth is
 # configured (BAJUTSU_OAUTH_GITHUB_*), never on the default path (the import guard locks this).
-oauth = ["authlib>=1.3", "httpx>=0.27"]
+# `joserfc` is declared directly, not leaned on through Authlib: Authlib only began depending on
+# it in 1.7.0, so the `authlib>=1.3` floor does not guarantee it and today's lock carries it only
+# because that lock happens to pin 1.7.2. It verifies a CI job's OIDC token (BE-0414).
+oauth = ["authlib>=1.3", "httpx>=0.27", "joserfc>=1.7"]
 # JSON Schema validation for the `responseSchema` assertion (BE-0048). Imported lazily, only when a
 # responseSchema assertion is evaluated — never on the default path.
 schema = ["jsonschema>=4.0"]

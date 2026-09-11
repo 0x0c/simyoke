@@ -13,16 +13,113 @@ differs, since target ownership stays in configuration either way.
 
 from __future__ import annotations
 
+import logging
+import re
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any
 
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationError, model_validator
 
 from bajutsu.common import _yaml
 from bajutsu.common.config import Config, _Model, parse_config_dict
+from bajutsu.serve.oidc import WorkloadClaims
 
 if TYPE_CHECKING:  # keeps the default serve/CLI path free of `serve.server` (server/__init__.py)
     from bajutsu.serve.server.db import Repository
+
+_logger = logging.getLogger(__name__)
+
+# An `allowedRepositories` name: exactly `"<owner>/<repo>"`, with neither half empty and no stray
+# whitespace. Validated rather than accepted as free text because matching is exact equality — a
+# malformed entry would otherwise sit in the config matching nothing, reading as a grant that is
+# silently inert.
+_REPOSITORY_RE = re.compile(r"[^\s/]+/[^\s/]+")
+
+
+class AllowedRepository(_Model):
+    """One entry of an org's `allowedRepositories` (BE-0414 unit 2).
+
+    Written either as the bare `"<owner>/<repo>"` string or as an object carrying that same name
+    plus its own narrowing bounds, so one org can list a repository that runs under a deployment
+    environment beside one that does not — without a second org existing only to hold the
+    unbounded entry.
+
+    Anyone who can merge a workflow change to a listed repository can mint a token from it, so the
+    name alone means "whoever can write that repository's workflows may act as this org". The
+    optional bounds tighten that to a reviewed environment, a ref, or one workflow file.
+
+    Attributes:
+        repository: The `"<owner>/<repo>"` name, compared to the token's own repository claim by
+            exact equality. A *mutable* name, consciously: an immutable numeric id would close the
+            name-recycling exposure but leaves a configuration nobody can read, so the operator
+            carries the duty to update an entry whose repository is renamed, transferred, or
+            deleted — and to revoke its outstanding machine sessions.
+        environment: When set, the job must have declared this deployment environment. A GitHub
+            Environment can require reviewers before a job runs, which is the tightest bound
+            available to a repository that also takes outside contributions.
+        ref: When set, the git ref the run must have been triggered on.
+        workflow_ref: When set, the workflow definition the job must have run from — GitHub
+            Actions' `job_workflow_ref` claim, named provider-neutrally here because the bound
+            means the same thing on every platform that emits one.
+    """
+
+    repository: str
+    environment: str | None = None
+    ref: str | None = None
+    workflow_ref: str | None = Field(default=None, alias="workflowRef")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_a_bare_name(cls, data: Any) -> Any:
+        """Let an entry needing no bound stay the one-line string it reads best as."""
+        return {"repository": data} if isinstance(data, str) else data
+
+    @model_validator(mode="after")
+    def _check_the_entry(self) -> AllowedRepository:
+        if not _REPOSITORY_RE.fullmatch(self.repository):
+            raise ValueError(
+                f'allowedRepositories entries must each be "<owner>/<repo>", got {self.repository!r}'
+            )
+        # An empty bound is the same silently-inert grant the name check above exists to prevent,
+        # one field over: `admits` treats a bound as active whenever it is not None, while a claim
+        # that arrives empty reads as absent (`oidc._text`) — so `environment: ""` would match
+        # nothing at all while looking in the config exactly like a narrowing that works.
+        for field, value in (
+            ("environment", self.environment),
+            ("ref", self.ref),
+            ("workflowRef", self.workflow_ref),
+        ):
+            if value is not None and not value.strip():
+                raise ValueError(f"an allowedRepositories {field} bound must not be empty")
+        return self
+
+    def admits(self, workload: WorkloadClaims) -> bool:
+        """Whether this entry admits the pipeline *workload* names.
+
+        Exact equality throughout, never a prefix test: `acme/app` prefix-matches `acme/app-evil`,
+        so a substring comparison would admit a repository the operator never listed. A configured
+        bound refuses an absent claim as firmly as a differing one — `environment` is emitted only
+        when the job references one, so anything weaker would let a job declaring no environment
+        escape the narrowing entirely.
+
+        The repository name is compared case-insensitively, because GitHub itself treats owner and
+        repository names that way: `Acme/App` and `acme/app` cannot both exist, so an operator who
+        types the casing differently from the claim means the same repository — and a
+        case-sensitive test would answer them with an entry that admits nobody.
+
+        `str.lower`, not `str.casefold`, for the reason `in_teams` below spells out at length:
+        full case folding equates names GitHub keeps distinct, so a repository whose name merely
+        *folds* equal to a listed one would clear this gate. Lowercasing equates nothing beyond
+        ASCII case, which is all GitHub's own case-insensitivity implies.
+
+        The bounds stay case-sensitive: a ref and a workflow path are not GitHub names.
+        """
+        return (
+            workload.repository.lower() == self.repository.lower()
+            and (self.environment is None or workload.environment == self.environment)
+            and (self.ref is None or workload.ref == self.ref)
+            and (self.workflow_ref is None or workload.workflow_ref == self.workflow_ref)
+        )
 
 
 class OrgConfig(_Model):
@@ -54,6 +151,13 @@ class OrgConfig(_Model):
     github_teams: list[str] = Field(default_factory=list, alias="githubTeams")
     editor_teams: list[str] = Field(default_factory=list, alias="editorTeams")
     targets: list[str] = Field(default_factory=list)
+    # The repositories whose continuous-integration (CI) jobs may exchange an OIDC token for a
+    # machine session acting as this org (BE-0414 unit 2). A *machine* roster, deliberately beside
+    # the human one rather than folded into it: `members` and the Team lists grant a person a role,
+    # and a pipeline gets no role at all — only the endpoint allowlist a machine principal carries.
+    allowed_repositories: list[AllowedRepository] = Field(
+        default_factory=list, alias="allowedRepositories"
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -92,6 +196,15 @@ class OrgConfig(_Model):
         the same union and cannot disagree about whether `editor_teams` alone admits anyone.
         """
         return [*self.github_teams, *self.editor_teams]
+
+    def admits_workload(self, workload: WorkloadClaims) -> bool:
+        """Whether any `allowedRepositories` entry admits the pipeline *workload* names.
+
+        An org listing nothing admits nothing, so the machine path stays off until an operator
+        opts a repository in — the same posture as an unconfigured audience disabling the caller
+        shape outright.
+        """
+        return any(entry.admits(workload) for entry in self.allowed_repositories)
 
 
 # The single tenant every unassigned user and target falls into.
@@ -281,20 +394,49 @@ def orgs_from_db(repository: Repository) -> dict[str, OrgConfig]:
             githubOrgs=list(row.github_orgs),
             githubTeams=list(row.github_teams),
             editorTeams=list(row.editor_teams),
+            allowedRepositories=_stored_repositories(row.id, row.allowed_repositories),
         )
         for row in repository.list_orgs()
     }
 
 
+def _stored_repositories(org: str, entries: Sequence[Any]) -> list[AllowedRepository]:
+    """The machine-roster entries of a stored org row, dropping any that no longer validate.
+
+    Unlike the `orgs:` block, which fails loudly at parse because an operator is there to fix it,
+    a malformed row here must not raise: `orgs_from_db` builds the model the *human* sign-in path
+    resolves against (BE-0375), so one bad entry — a direct database edit, a rollback, a future
+    writer — would otherwise turn every person's login into a denial as well as every pipeline's.
+
+    Dropping fails closed in the direction that matters: the machine roster only ever *grants*, so
+    an entry nobody can read admits nobody, which is what an unreadable grant has to mean.
+    """
+    kept: list[AllowedRepository] = []
+    for entry in entries:
+        try:
+            kept.append(AllowedRepository.model_validate(entry))
+        except ValidationError:
+            _logger.warning(
+                "org %s has an unreadable allowedRepositories entry; it admits nothing: %r",
+                org,
+                entry,
+            )
+    return kept
+
+
 def orgs_declaring_membership(orgs: dict[str, OrgConfig]) -> list[str]:
-    """The entries that declare `members` / `githubOrgs` / `githubTeams` / `editorTeams` (BE-0375).
+    """The entries that declare a roster — human or machine (BE-0375, widened by BE-0414 unit 2).
 
     An entry carrying only `targets` is the end state a database-backed deployment is meant to
     reach, since target ownership stays in configuration, so it is never one of these — which is
     what lets the caller warn about the rest without firing forever on a correct configuration.
+    `allowedRepositories` counts as a roster for the same reason the human lists do: an entry that
+    declares one and never gets seeded would leave its pipelines locked out with nothing saying why.
     """
     return [
-        name for name, oc in orgs.items() if oc.members or oc.github_orgs or oc.admitting_teams()
+        name
+        for name, oc in orgs.items()
+        if oc.members or oc.github_orgs or oc.admitting_teams() or oc.allowed_repositories
     ]
 
 
@@ -327,6 +469,7 @@ def seed_orgs_from_config(repository: Repository, orgs: dict[str, OrgConfig]) ->
             github_orgs=list(oc.github_orgs),
             github_teams=list(oc.github_teams),
             editor_teams=list(oc.editor_teams),
+            allowed_repositories=[e.model_dump(by_alias=True) for e in oc.allowed_repositories],
         )
         if not seeded:
             stale.append(name)

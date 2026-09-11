@@ -190,13 +190,26 @@ def make_app(state: ServeState) -> FastAPI:  # noqa: C901, PLR0915
             return _hardened(
                 JSONResponse({"error": "cross-origin request blocked"}, status_code=403)
             )
-        if state.auth.token is not None:
-            path, method = request.url.path, request.method
-            if not gate.is_open(method, path) and not _authorized(request):
+        path, method = request.url.path, request.method
+        # An open endpoint skips *both* gates, exactly as the stdlib handler's `_gate` returns
+        # early on `is_open` before either runs. Keeping the machine check inside this branch is
+        # what stops the two backends disagreeing about whether a caller holding a machine cookie
+        # may still load the index or re-exchange its token — a divergence on a security branch is
+        # the failure BE-0253 put this policy in `gate.py` to prevent.
+        if state.auth.token is not None and not gate.is_open(
+            method, path, oidc=state.auth.oidc is not None
+        ):
+            if not _authorized(request):
                 return _hardened(JSONResponse({"error": "unauthorized"}, status_code=401))
+            # Which of the three caller shapes is this? A machine session (BE-0414) carries an
+            # identity like a human one, so its own gate runs first and unconditionally — the role
+            # gate below would read it as a user with no row and default it to viewer.
+            machine = gate.machine_principal(state.auth, request.cookies.get(_SESSION_COOKIE))
+            if machine is not None and gate.forbidden_for_machine(method, path):
+                return _hardened(JSONResponse({"error": "forbidden"}, status_code=403))
             # Enforce the user's role on mutating endpoints for an OAuth session (an identity) when a
             # database is wired (BE-0015 7c-2); token/Bearer has no identity and stays full-access.
-            login = _actor(request)
+            login = None if machine is not None else _actor(request)
             if (
                 login is not None
                 and state.repository is not None
@@ -307,6 +320,26 @@ def make_app(state: ServeState) -> FastAPI:  # noqa: C901, PLR0915
     @app.post(_LOGIN_PATH)
     async def login(body: dict[str, Any]) -> JSONResponse:
         payload, status, sid = ops.login(state, str(body.get("token", "") or ""))
+        resp = JSONResponse(payload, status_code=status)
+        if sid is not None:
+            resp.set_cookie(_SESSION_COOKIE, sid, httponly=True, samesite="strict", path="/")
+        return resp
+
+    @app.post(gate.OIDC_EXCHANGE_PATH)
+    async def oidc_exchange(body: dict[str, Any]) -> JSONResponse:
+        # Mirror of the stdlib handler's `_post_oidc_exchange` (BE-0414 unit 1): a CI job presents
+        # its OIDC token and gets a machine session cookie, so every later call in the pipeline is
+        # an ordinary session request both backends already handle identically.
+        # Off the event loop: verification can fetch the issuer's key set (a 5s timeout, taken
+        # under `JwksCache`'s lock) and then writes the replay row, so running it inline would
+        # stall every worker lease and heartbeat on this replica. `oauth_callback` below already
+        # does the same for the same reason.
+        payload, status, sid = await run_in_threadpool(
+            ops.oidc_exchange,
+            state,
+            str(body.get("token", "") or ""),
+            str(body.get("org", "") or ""),
+        )
         resp = JSONResponse(payload, status_code=status)
         if sid is not None:
             resp.set_cookie(_SESSION_COOKIE, sid, httponly=True, samesite="strict", path="/")

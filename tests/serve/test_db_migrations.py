@@ -227,3 +227,49 @@ def test_downgrade_base_removes_the_tables(migration_db_url: str) -> None:
     finally:
         engine.dispose()
     assert remaining == set()
+
+
+@pytest.mark.parametrize("migration_db_url", _DIALECTS, indirect=True)
+def test_0020_carries_live_sessions_and_orgs_through_the_table_rebuild(
+    migration_db_url: str,
+) -> None:
+    """0020's downgrade drops columns, which SQLite can only do by rebuilding the table. Every
+    other migration test starts from an empty database, so a rebuild that silently dropped live
+    rows — signing every user out, or losing an org's membership — would go unnoticed."""
+    from alembic import command
+
+    cfg = _alembic_config()
+    command.upgrade(cfg, "0019")
+    engine = create_engine(migration_db_url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO orgs (id, slug, name, members) "
+                    "VALUES ('acme', 'acme', 'Acme', '[]')"
+                )
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO sessions (id, identity, expires_at) "
+                    "VALUES ('s1', 'alice', '2099-01-01 00:00:00')"
+                )
+            )
+        command.upgrade(cfg, "0020")
+        with engine.begin() as conn:
+            # Additive and unbackfilled: the live session stays live and reads as human, and the
+            # org admits no pipeline until an operator lists one.
+            assert [tuple(r) for r in conn.execute(text("SELECT org, kind FROM sessions"))] == [
+                (None, None)
+            ]
+            assert [
+                tuple(r) for r in conn.execute(text("SELECT allowed_repositories FROM orgs"))
+            ] == [(None,)]
+        command.downgrade(cfg, "0019")
+        with engine.begin() as conn:
+            assert [tuple(r) for r in conn.execute(text("SELECT id, identity FROM sessions"))] == [
+                ("s1", "alice")
+            ]
+            assert [tuple(r) for r in conn.execute(text("SELECT id FROM orgs"))] == [("acme",)]
+    finally:
+        engine.dispose()

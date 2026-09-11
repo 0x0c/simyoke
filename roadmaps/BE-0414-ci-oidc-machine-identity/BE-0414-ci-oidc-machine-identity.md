@@ -7,7 +7,7 @@
 |---|---|
 | Proposal | [BE-0414](BE-0414-ci-oidc-machine-identity.md) |
 | Author | [@paihu](https://github.com/paihu) |
-| Status | **Proposal** |
+| Status | **In progress** |
 | Tracking issue | [Search](https://github.com/bajutsu-e2e/bajutsu/issues?q=is%3Aissue+label%3Aroadmap-tracking+in%3Atitle+"BE-0414") |
 | Topic | Hosting the web UI |
 | Related | [BE-0313](../BE-0313-github-org-team-rbac/BE-0313-github-org-team-rbac.md), [BE-0051](../BE-0051-serve-hardening-for-hosting/BE-0051-serve-hardening-for-hosting.md), [BE-0015](../BE-0015-web-ui-public-hosting/BE-0015-web-ui-public-hosting.md) |
@@ -462,7 +462,7 @@ serve configuration.
 > *Detailed design* (one box per unit of work); the log records what changed and when
 > (oldest first), linking the PRs.
 
-- [ ] Unit 1 — Exchange the token for a machine session at `POST /api/oidc/exchange`. It verifies
+- [x] Unit 1 — Exchange the token for a machine session at `POST /api/oidc/exchange`. It verifies
       issuer, JWKS with a bounded `kid` refresh and a pinned RS256 algorithm allowlist,
       deployment-configured `aud` (fail closed if unset), and lifetime. A `jti` replay defense shared
       across replicas through the `Repository` seam (refusing a token with no `jti`), a per-session
@@ -471,7 +471,7 @@ serve configuration.
       revision for those columns and the replay table, `joserfc`
       declared directly in the `oauth` extra, and its verification kept in its own lazily-imported
       module so `gate.py` stays free of it.
-- [ ] Unit 2 — `allowedRepositories` on `OrgConfig`, checked against the discrete claims for the org
+- [x] Unit 2 — `allowedRepositories` on `OrgConfig`, checked against the discrete claims for the org
       the exchange request names, with the optional per-entry `environment` / `ref` /
       `job_workflow_ref` narrowing and an `environment` bound refusing an absent claim.
 - [ ] Unit 3 — The machine session (identity `repo:<owner>/<repo>`, revocable) and its endpoint

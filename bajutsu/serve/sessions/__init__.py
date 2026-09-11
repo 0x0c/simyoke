@@ -9,6 +9,15 @@ survive restarts and span control-plane processes; the seam keeps `ServeState` a
 unaware of which is in use."""
 
 from .in_memory_session_store import InMemorySessionStore
+from .principal import HUMAN, MACHINE, Principal, PrincipalKind, kind_from_stored
 from .session_store import SessionStore
 
-__all__ = ["InMemorySessionStore", "SessionStore"]
+__all__ = [
+    "HUMAN",
+    "MACHINE",
+    "InMemorySessionStore",
+    "Principal",
+    "PrincipalKind",
+    "SessionStore",
+    "kind_from_stored",
+]

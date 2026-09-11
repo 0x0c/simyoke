@@ -480,6 +480,120 @@ and nothing else. The browser token-login endpoint
 non-worker endpoints with the token loses that path once OAuth is on. Without OAuth (the single-Mac,
 private-network shape) the token is unchanged and still reaches everything.
 
+### Authenticating a CI job (optional, BE-0414)
+
+A continuous-integration (CI) job is neither of the two callers above. It cannot complete a browser
+sign-in, and the paragraph just above is its problem: once OAuth is on, the shared token no longer
+reaches a non-worker endpoint. Rather than hand every pipeline a long-lived secret,
+[BE-0414](../roadmaps/BE-0414-ci-oidc-machine-identity/BE-0414-ci-oidc-machine-identity.md) lets a
+job authenticate with the **OpenID Connect (OIDC) token its CI platform already issues it**, and
+exchanges that once for a short-lived **machine session**. The pipeline stores no secret at all, and
+the deployment learns *which repository* acted rather than only that "the token" did.
+
+> **Status.** This release ships the exchange and the roster it checks against. What a machine
+> session may *do* is the item's unit 3, which is not in yet — until it lands, a minted machine
+> session is **refused on every endpoint**. Configure this now if you want the credential path
+> ready; a pipeline cannot use it to publish an artifact or dispatch a run yet.
+
+**On the CI side there is nothing to register** — no GitHub App, no OAuth app, no identity provider.
+A GitHub Actions job declares one permission and asks for a token:
+
+```yaml
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # the whole GitHub-side setup
+    steps:
+      - name: Exchange the OIDC token for a Bajutsu machine session
+        run: |
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BAJUTSU_AUDIENCE" | jq -r .value)
+          curl -sS -c cookies.txt -X POST "$BAJUTSU_URL/api/oidc/exchange" \
+            -H 'Content-Type: application/json' \
+            -d "{\"token\": \"$token\", \"org\": \"acme\"}"
+        env:
+          BAJUTSU_URL: https://bajutsu.example.com
+          BAJUTSU_AUDIENCE: https://bajutsu.example.com
+```
+
+Every later call in the pipeline presents the **cookie**, never the OIDC token again.
+
+**On the serve side**, set the audience — that one variable is what turns the whole caller shape on:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `BAJUTSU_OIDC_AUDIENCE` | *(unset)* | The `aud` a token must carry. **Unset disables OIDC entirely**: the exchange endpoint is not even reachable. |
+| `BAJUTSU_OIDC_PROVIDER` | `github-actions` | Which CI platform's claim names to read. GitHub Actions is the only one today. |
+| `BAJUTSU_OIDC_ISSUER` | the provider's own | Override for a self-hosted installation — GitHub Enterprise Server issues from its own hostname. |
+| `BAJUTSU_OIDC_MAX_TOKEN_AGE` | `300` | Seconds since the token's `iat` past which it is refused, independent of its own `exp`. |
+| `BAJUTSU_OIDC_SESSION_TTL` | `900` | Seconds the minted machine session lives. Capped by both the token's own `exp` and the deployment-wide `BAJUTSU_SESSION_TTL`, so the shortest of the three wins. |
+
+**Set the audience deliberately.** The *workflow* chooses the audience it asks GitHub for, so a
+deployment that accepted any would accept a token some unrelated service minted for itself. There is
+deliberately no default: leaving it unset switches the caller shape off rather than falling back to
+"accept whatever arrives".
+
+**The exchange needs a database, and the `oauth` extra.** Each token's `jti` is spent in the
+shared system of record, so single-use holds across control-plane replicas rather than only within
+one process — with no `BAJUTSU_DATABASE_URL` the exchange refuses every request. The token
+signature is verified with `joserfc`, which ships in the `oauth` extra (`uv sync --extra oauth`),
+the same extra GitHub OAuth needs. `serve` warns about either at boot rather than letting a
+pipeline discover it one failed run at a time.
+
+Then list the repositories each org admits, under `allowedRepositories`:
+
+```yaml
+orgs:
+  acme:
+    members: [alice]
+    allowedRepositories:
+      - acme/app                         # any workflow in this repository
+      - repository: acme/web             # …or narrowed further
+        environment: production
+```
+
+An entry is either the bare `"<owner>/<repo>"` name or an object carrying that name plus a bound —
+`environment`, `ref`, or `workflowRef` (GitHub Actions' `job_workflow_ref` claim). A bound applies
+to **its own entry only**, so one org can list a reviewed-environment repository beside an
+unbounded one. Matching is exact equality on the token's discrete claims, never a parse of `sub` and
+never a prefix — `acme/app` does not admit `acme/app-evil`.
+
+The exchange request **names the org**, and naming it *selects, it never grants*: that org's own
+`allowedRepositories` is what admits the token. Requiring the name is what lets one shared pipeline
+repository serve several orgs, which inferring the org would have to forbid.
+
+Like the membership lists beside it, the roster lives in the database once one is wired, so an admin
+edits it through `POST /api/orgs/<slug>/membership` without a redeploy. Omitting
+`allowedRepositories` from that body leaves it untouched — only sending the key, `[]` included,
+replaces it — so a client that predates the field cannot silently revoke every pipeline.
+
+Three hazards worth reading before you list a repository:
+
+- **A repository name is mutable.** Deleting, renaming, or transferring a repository frees its name,
+  and whoever claims it next can mint tokens matching your entry. Update or remove an entry the
+  moment its repository changes.
+- **Whoever can merge a workflow can mint a token.** `allowedRepositories: [acme/app]` means
+  "whoever can write that repository's workflows may act as this org". Narrow by `environment` when
+  that is too broad — a GitHub Environment can require reviewers before the job runs.
+- **Fork pull requests.** A fork's pull request does not get `id-token: write` by default, but a
+  `pull_request_target` workflow runs in the base repository's context and can, as does a repository
+  setting that sends write tokens to fork pull requests. Narrow such a repository by `environment`
+  so no token is ever minted from a run an outside contributor influenced.
+
+Finally, a machine session is **revocable in principle** where a GitHub-issued token is not:
+every session a repository mints carries the identity `repo:<owner>/<repo>`, which is what a
+revocation would act on, and the granularity is per repository rather than per job — so revoking
+would end that repository's concurrent pipelines too.
+
+> **Not yet wired.** Retiring an org revokes its *members'* sessions, not the machine sessions
+> bound to it, and there is no endpoint that revokes a repository's sessions on their own. Both
+> are BE-0414 unit 3. Until then a machine session lives out its `BAJUTSU_OIDC_SESSION_TTL`
+> whatever the operator does — which is inert while unit 3's allowlist is absent and every machine
+> session is refused everywhere, and is why the TTL is the bound that actually matters today. Keep
+> it short, and treat removing an `allowedRepositories` entry as stopping *new* sessions rather
+> than ending live ones.
+
 ### Operator secrets (the Claude API key)
 
 The **API key** an admin sets through the settings panel is an *operator secret*, and on the hosted

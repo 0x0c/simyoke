@@ -210,6 +210,10 @@ ROUTES: tuple[Route, ...] = (
     Route("POST", "/api/scenarios/upload", off_loop=True),
     # --- POST: login (off_loop, sets the session cookie) ---
     Route("POST", "/api/login", off_loop=True),
+    # A CI job's way in (BE-0414): it presents the OIDC token its platform issued and gets a
+    # machine session cookie back, so every later call in the pipeline is an ordinary session
+    # request. `off_loop` for the same reason login is — it writes a `Set-Cookie`.
+    Route("POST", "/api/oidc/exchange", off_loop=True),
     # --- POST: uniform JSON actions ---
     Route(
         "POST",

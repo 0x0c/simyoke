@@ -101,11 +101,18 @@ class Repository(Protocol):
         github_orgs: list[str],
         github_teams: list[str],
         editor_teams: list[str],
+        allowed_repositories: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Replace a live org's membership as one unit (BE-0375). False when there is no such org.
 
         Stamps `membership_seeded_at` when it is not yet set: an API write is a cutover event just
         as creation is, so no later `orgs:` entry can seed over what an admin set here.
+
+        *allowed_repositories* is the exception to "as one unit": None leaves the machine roster
+        (BE-0414 unit 2) untouched, and only an explicit list — `[]` included — replaces it. The
+        human roster is safe to replace wholesale because every caller predating a field sends the
+        others; a caller predating *this* field would otherwise revoke every pipeline's access and
+        get a 200 back saying so, the failure `editorTeam`'s loud refusal exists to prevent.
         """
 
     def seed_org_membership(
@@ -118,6 +125,7 @@ class Repository(Protocol):
         github_orgs: list[str],
         github_teams: list[str],
         editor_teams: list[str],
+        allowed_repositories: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Seed an org's membership from a bound config's `orgs:` entry, once (BE-0375).
 
@@ -125,6 +133,16 @@ class Repository(Protocol):
         but an id, a slug, and a name; either way it stamps `membership_seeded_at`, after which the
         database owns that org's membership and this is a no-op. Returns whether it seeded. A row
         already marked seeded, and a soft-deleted one, are both left alone — retired, not unseeded.
+        """
+
+    def spend_oidc_jti(self, jti: str, *, expires_at: datetime) -> bool:
+        """Claim *jti* as spent, returning False when it already was (BE-0414 unit 1).
+
+        The single-use rule behind the OIDC exchange, in the shared system of record rather than
+        in a process: a hosted control plane runs several replicas over one database, and a
+        per-process cache would let a captured token be replayed against a second replica. A row
+        already past *expires_at* is not treated as spent — the token it named is refused on its
+        own lifetime by then — so the table stays bounded without a sweep of its own.
         """
 
     def soft_delete_org(self, org_id: str, *, at: datetime) -> bool:

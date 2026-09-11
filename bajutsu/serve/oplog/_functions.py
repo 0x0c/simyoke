@@ -28,6 +28,12 @@ EVENTS: frozenset[str] = frozenset(
         "run.purged",
         "oauth.login",
         "oauth.denied",
+        # The OIDC exchange (BE-0414): a CI job traded its token for a machine session, or was
+        # refused. The refusal is the one that matters operationally — every cause answers the
+        # caller identically, so this log is the only place the actual reason is recorded, and a
+        # run of them is how an operator sees a misconfigured `aud` or an unlisted repository.
+        "oidc.exchange",
+        "oidc.denied",
         # An org's membership is seeded from `orgs:` once and then owned by the database (BE-0375);
         # this reports a config entry whose membership fields are consequently no longer read. It
         # fires at a config rebind as well as at boot, so it can't ride on `server.startup_warning`.

@@ -7,10 +7,14 @@ from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from bajutsu.serve.sessions import HUMAN, Principal, PrincipalKind
+
 from ._shared import _DEFAULT_TTL
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
+
+    from bajutsu.serve.server.models import SessionRecord
 
 
 class SqlSessionStore:
@@ -35,30 +39,47 @@ class SqlSessionStore:
             return dt.replace(tzinfo=UTC)
         return dt
 
-    def issue(self, identity: str | None = None) -> str:
+    def issue(
+        self,
+        identity: str | None = None,
+        *,
+        expires_at: datetime | None = None,
+        org: str | None = None,
+        kind: PrincipalKind = HUMAN,
+    ) -> str:
         from sqlalchemy.orm import Session
 
         from bajutsu.serve.server.models import SessionRecord
 
         sid = secrets.token_urlsafe(32)
-        expires = self._now() + timedelta(seconds=self._ttl)
+        # A caller's own expiry wins over the store-level time-to-live, never extends it: a machine
+        # session is capped by its token's `exp` (BE-0414 unit 1), and the cap is the whole reason
+        # the exchange is an improvement on re-presenting that token.
+        store_expiry = self._now() + timedelta(seconds=self._ttl)
+        expires = store_expiry if expires_at is None else min(expires_at, store_expiry)
         with Session(self._engine) as session:
-            session.add(SessionRecord(id=sid, identity=identity, expires_at=expires))
+            session.add(
+                SessionRecord(id=sid, identity=identity, expires_at=expires, org=org, kind=kind)
+            )
             session.commit()
         return sid
 
     def valid(self, sid: str) -> bool:
-        from sqlalchemy.orm import Session
-
-        from bajutsu.serve.server.models import SessionRecord
-
-        with Session(self._engine) as session:
-            row = session.get(SessionRecord, sid)
-            if row is None:
-                return False
-            return self._ensure_aware(row.expires_at) >= self._now()
+        return self._live(sid) is not None
 
     def identity(self, sid: str) -> str | None:
+        row = self._live(sid)
+        return row.identity if row is not None else None
+
+    def principal(self, sid: str) -> Principal | None:
+        row = self._live(sid)
+        if row is None:
+            return None
+        return Principal.from_stored(row.identity, row.org, row.kind)
+
+    def _live(self, sid: str) -> SessionRecord | None:
+        """The row *sid* names while it is still live. Expiry is enforced on read; nothing sweeps
+        an expired row, it simply stops validating."""
         from sqlalchemy.orm import Session
 
         from bajutsu.serve.server.models import SessionRecord
@@ -67,7 +88,8 @@ class SqlSessionStore:
             row = session.get(SessionRecord, sid)
             if row is None or self._ensure_aware(row.expires_at) < self._now():
                 return None
-            return row.identity
+            session.expunge(row)
+            return row
 
     def revoke_identities(self, identities: Iterable[str]) -> int:
         from sqlalchemy import delete
