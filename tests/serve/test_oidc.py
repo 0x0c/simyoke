@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.request
 from typing import Any
 
 import pytest
@@ -22,6 +23,8 @@ from bajutsu.serve.oidc import (
     OidcConfig,
     OidcError,
     OidcProvider,
+    _HttpsOnlyRedirect,
+    _opener,
     verify,
 )
 
@@ -529,3 +532,52 @@ def test_a_redirect_to_plain_http_is_refused_even_from_an_https_url() -> None:
     with pytest.raises(OidcError, match="HTTPS"):
         _https("http://evil.example.com/keys")
     assert _https("https://token.example.com/keys") == "https://token.example.com/keys"
+
+
+@pytest.mark.parametrize(
+    ("offset", "accepted"),
+    [(600, False), (30, True), (0, True), (-600, True)],
+)
+def test_a_token_is_refused_before_its_nbf(offset: int, accepted: bool) -> None:
+    """`nbf` is optional in RFC 7519, so nothing forces the claims registry to reach it. Pinned
+    here rather than left to `validate()`'s dispatch: a token 10 minutes early must be refused,
+    while one inside the 60s clock-skew allowance must not be — the same tolerance every other
+    lifetime check gets."""
+    key = _key()
+    cache = JwksCache(ISSUER, fetch=_fetcher(key))
+    now = time.time()
+    token = _token(key, now=now, nbf=int(now) + offset)
+    if accepted:
+        assert verify(token, _config(), cache, now=now).workload.repository == "acme/app"
+    else:
+        with pytest.raises(OidcError, match="claims were refused"):
+            verify(token, _config(), cache, now=now)
+
+
+def test_a_redirect_through_plain_http_is_refused_even_when_it_ends_on_https() -> None:
+    """`urlopen` walks the whole chain before returning, so checking only the final URL would let
+    `https -> http -> https` make its middle request in cleartext — the rewritable hop that
+    decides where the last one goes, and so what ends up being trusted as the key set."""
+    handler = _HttpsOnlyRedirect()
+    with pytest.raises(OidcError, match="HTTPS"):
+        handler.redirect_request(None, None, 302, "Found", {}, "http://evil.example.com/keys")
+
+
+def test_a_redirect_that_stays_on_https_is_allowed() -> None:
+    """The guard rejects the scheme, not redirects as such — an issuer may legitimately move its
+    key set within HTTPS."""
+    request = urllib.request.Request("https://token.example.com/keys")
+    handler = _HttpsOnlyRedirect()
+    redirected = handler.redirect_request(
+        request, None, 302, "Found", {}, "https://token.example.com/keys2"
+    )
+    assert redirected is not None
+    assert redirected.full_url == "https://token.example.com/keys2"
+
+
+def test_the_jwks_fetcher_reads_through_the_https_only_opener() -> None:
+    """The guard is only worth having if the real fetch actually goes through it — a handler that
+    exists but is never installed protects nothing. `handlers` is untyped in typeshed, hence the
+    `getattr`."""
+    installed = getattr(_opener, "handlers", [])
+    assert any(isinstance(handler, _HttpsOnlyRedirect) for handler in installed)

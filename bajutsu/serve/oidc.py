@@ -295,6 +295,11 @@ def verify(
             iss={"essential": True, "value": config.issuer},
             aud={"essential": True, "value": config.audience},
             exp={"essential": True},
+            # Named though it is optional (RFC 7519), so the check does not rest on `validate()`
+            # happening to reach a claim it was handed no option for — a dispatch change upstream
+            # would otherwise drop it silently, and a token is refused before its `nbf` only
+            # because that method reaches it today.
+            nbf={"essential": False},
             iat={"essential": True},
             jti={"essential": True},
         ).validate(claims)
@@ -367,15 +372,36 @@ def _https(url: str) -> str:
     return url
 
 
+class _HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse a redirect that would read the key set over plain HTTP, intermediate hops included.
+
+    Checking only the URL finally served is not enough: `urlopen` walks the whole chain before it
+    returns, so `https → http → https` makes the middle request in cleartext and still hands back
+    an `https` final URL. That middle hop is exactly the rewritable channel `_https` exists to
+    deny — whatever answers it chooses where the next one goes, and the key set that comes back
+    becomes the root of trust for every token this deployment verifies.
+    """
+
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> Any:
+        _https(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Built once: an opener carries no per-request state, and rebuilding it per fetch would only add
+# work to a path already bounded by the refresh floor.
+_opener = urllib.request.build_opener(_HttpsOnlyRedirect)
+
+
 def _fetch_url(url: str) -> bytes:
     """The real discovery/JWKS read. `_https` has already rejected a non-HTTPS URL.
 
-    The URL actually served is re-checked, because `urlopen` follows redirects and its redirect
-    handler permits an `https` → `http` hop: validating only the URL we asked for would leave the
-    root of trust readable over a channel an intermediary can rewrite, which is exactly what
-    `_https` is there to prevent.
+    Read through an opener that re-applies that rule to every redirect target rather than through
+    the stdlib default, which permits an `https` → `http` hop. The URL finally served is checked
+    again afterwards as belt and braces.
     """
     request = urllib.request.Request(url, headers={"Accept": "application/json"})  # noqa: S310
-    with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_SECONDS) as response:  # noqa: S310
+    with _opener.open(request, timeout=_FETCH_TIMEOUT_SECONDS) as response:
         _https(response.url)
         return bytes(response.read())
