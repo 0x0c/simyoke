@@ -75,6 +75,7 @@ _EXPECTED: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/scenarios/upload"),
         # --- POST: login (off_loop, sets cookie) ---
         ("POST", "/api/login"),
+        ("POST", "/api/oidc/exchange"),
         # --- POST: uniform JSON actions ---
         ("POST", "/api/config"),
         ("POST", "/api/apikey"),

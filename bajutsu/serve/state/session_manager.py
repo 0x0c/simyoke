@@ -6,9 +6,18 @@ import secrets
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from bajutsu.serve.sessions import InMemorySessionStore, SessionStore
+from bajutsu.serve.oidc import OidcConfig
+from bajutsu.serve.sessions import (
+    HUMAN,
+    InMemorySessionStore,
+    Principal,
+    PrincipalKind,
+    SessionStore,
+)
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from bajutsu.serve.server.oauth import OAuthClient
 
 
@@ -39,16 +48,37 @@ class SessionManager:
     sessions: SessionStore = field(default_factory=InMemorySessionStore)
     oauth: OAuthClient | None = None
     oauth_admin_teams: tuple[str, ...] = ()
+    # The OIDC settings a CI job's token is verified against (BE-0414), None when the deployment
+    # configures no expected audience — which disables the machine caller shape outright rather
+    # than falling back to accepting whichever audience a token carries. It sits here beside
+    # `oauth` because it is the third way a caller becomes authenticated, fixed at construction
+    # like the two above it.
+    oidc: OidcConfig | None = None
 
     def check_token(self, candidate: str) -> bool:
         """Constant-time compare of a presented token against the configured one."""
         return self.token is not None and secrets.compare_digest(candidate, self.token)
 
-    def issue_session(self, identity: str | None = None) -> str:
+    def issue_session(
+        self,
+        identity: str | None = None,
+        *,
+        expires_at: datetime | None = None,
+        org: str | None = None,
+        kind: PrincipalKind = HUMAN,
+    ) -> str:
         """Mint and remember a new opaque session id (returned to set as a cookie at login),
-        optionally bound to *identity* (the GitHub login from an OAuth login)."""
-        return self.sessions.issue(identity)
+        optionally bound to *identity* (the GitHub login from an OAuth login).
+
+        The OIDC exchange mints its machine session through this same call (BE-0414), passing the
+        cap its token's `exp` imposes plus the org and kind the gate reads back per request.
+        """
+        return self.sessions.issue(identity, expires_at=expires_at, org=org, kind=kind)
 
     def valid_session(self, sid: str) -> bool:
         """Whether *sid* is a known, live session id."""
         return self.sessions.valid(sid)
+
+    def principal(self, sid: str) -> Principal | None:
+        """Who *sid* belongs to, or None when it is unknown or expired (BE-0414)."""
+        return self.sessions.principal(sid)

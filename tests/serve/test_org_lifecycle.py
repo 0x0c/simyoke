@@ -446,6 +446,7 @@ def test_create_then_re_member_an_org_and_audit_both(
         "githubOrgs": [],
         "githubTeams": [],
         "editorTeams": [],
+        "allowedRepositories": [],  # nor any pipeline (BE-0414 unit 2)
         "reserved": False,
     }
 
@@ -483,6 +484,114 @@ def test_create_then_re_member_an_org_and_audit_both(
     )
     assert status == 400 and "editorTeam is retired" in payload["error"]
     assert orgs_from_db(state.repository)["initech"].editor_teams == ["initech-gh/leads"]
+
+
+# --- BE-0414 unit 2: the machine roster travels the same paths as the human one ---------------
+
+
+def test_the_machine_roster_round_trips_through_the_database(
+    serve_engine: Callable[..., Engine], tmp_path: Path
+) -> None:
+    """A DB-backed deployment reads its org model from `orgs_from_db`, and the exchange requires a
+    database — so `allowedRepositories` is dead unless it survives the round trip."""
+    state = _state(serve_engine, tmp_path)
+    assert state.repository is not None
+    admin = _admin(state)
+    ops.create_org(state, {"slug": "initech", "name": "Initech"}, actor=admin)
+
+    _payload, status = ops.update_org_membership(
+        state,
+        "initech",
+        {
+            "members": ["peter"],
+            "allowedRepositories": [
+                "initech/app",
+                {"repository": "initech/web", "environment": "production"},
+            ],
+        },
+        actor=admin,
+    )
+    assert status == 200
+    org = orgs_from_db(state.repository)["initech"]
+    assert [e.repository for e in org.allowed_repositories] == ["initech/app", "initech/web"]
+    assert org.allowed_repositories[0].environment is None
+    assert org.allowed_repositories[1].environment == "production"
+
+
+def test_omitting_the_machine_roster_leaves_it_alone(
+    serve_engine: Callable[..., Engine], tmp_path: Path
+) -> None:
+    """A client predating the field would otherwise revoke every pipeline's access and be told the
+    update succeeded — the silent strip `editorTeam`'s loud refusal exists to prevent."""
+    state = _state(serve_engine, tmp_path)
+    assert state.repository is not None
+    admin = _admin(state)
+    ops.create_org(state, {"slug": "initech", "name": "Initech"}, actor=admin)
+    ops.update_org_membership(
+        state, "initech", {"allowedRepositories": ["initech/app"]}, actor=admin
+    )
+
+    _payload, status = ops.update_org_membership(
+        state, "initech", {"members": ["peter"], "editorTeams": ["initech-gh/leads"]}, actor=admin
+    )
+    assert status == 200
+    org = orgs_from_db(state.repository)["initech"]
+    assert org.members == ["peter"]  # the human roster still replaces as one unit
+    assert [e.repository for e in org.allowed_repositories] == ["initech/app"]
+
+    # An explicit empty list is how an admin actually clears it.
+    ops.update_org_membership(state, "initech", {"allowedRepositories": []}, actor=admin)
+    assert orgs_from_db(state.repository)["initech"].allowed_repositories == []
+
+
+def test_a_malformed_machine_roster_is_refused_on_write(
+    serve_engine: Callable[..., Engine], tmp_path: Path
+) -> None:
+    state = _state(serve_engine, tmp_path)
+    assert state.repository is not None
+    admin = _admin(state)
+    ops.create_org(state, {"slug": "initech", "name": "Initech"}, actor=admin)
+
+    for bad in (["not-a-repo"], "initech/app", [{"repository": "initech/app", "nope": 1}]):
+        payload, status = ops.update_org_membership(
+            state, "initech", {"allowedRepositories": bad}, actor=admin
+        )
+        assert status == 400, bad
+        assert "allowedRepositories" in payload["error"]
+    assert orgs_from_db(state.repository)["initech"].allowed_repositories == []
+
+
+def test_the_machine_roster_is_audited_and_listed(
+    serve_engine: Callable[..., Engine], tmp_path: Path
+) -> None:
+    """Which repositories may act as a tenant is the machine half of "who could sign in as this
+    tenant, from when" — so it belongs in the audit entry, and in the list a form fills from."""
+    state = _state(serve_engine, tmp_path)
+    assert state.repository is not None
+    admin = _admin(state)
+    ops.create_org(state, {"slug": "initech", "name": "Initech"}, actor=admin)
+    ops.update_org_membership(
+        state, "initech", {"allowedRepositories": ["initech/app"]}, actor=admin
+    )
+
+    listed = next(o for o in ops.list_orgs_view(state, actor=admin)[0] if o["slug"] == "initech")
+    assert listed["allowedRepositories"] == [
+        {"repository": "initech/app", "environment": None, "ref": None, "workflowRef": None}
+    ]
+    detail = _audit_detail(state.repository, "org.membership.update")
+    assert detail["allowedRepositories"][0]["repository"] == "initech/app"
+
+
+def test_the_machine_roster_seeds_from_the_orgs_block(
+    serve_engine: Callable[..., Engine], tmp_path: Path
+) -> None:
+    """A config-only org whose sole roster is `allowedRepositories` converts like any other, rather
+    than being skipped as "declares nothing" and leaving its pipelines locked out."""
+    body = "targets: {}\norgs:\n  ci-only:\n    allowedRepositories: [acme/app]\n"
+    state = _state(serve_engine, tmp_path, body=body)
+    assert state.repository is not None
+    org = orgs_from_db(state.repository)["ci-only"]
+    assert [e.repository for e in org.allowed_repositories] == ["acme/app"]
 
 
 def test_creating_the_default_org_is_refused(
@@ -961,6 +1070,19 @@ def _audit_actions(repository: Repository) -> list[str]:
         return [row.action for row in session.scalars(select(AuditLog).order_by(AuditLog.action))]
 
 
+def _audit_detail(repository: Repository, action: str) -> dict[str, Any]:
+    """The detail payload of the one entry recording *action*."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from bajutsu.serve.server.models import AuditLog
+
+    engine = repository._engine  # type: ignore[attr-defined]
+    with Session(engine) as session:
+        row = session.scalars(select(AuditLog).where(AuditLog.action == action)).one()
+        return dict(row.detail)
+
+
 def test_soft_delete_stamps_the_moment_it_happened(
     serve_engine: Callable[..., Engine], tmp_path: Path
 ) -> None:
@@ -972,3 +1094,37 @@ def test_soft_delete_stamps_the_moment_it_happened(
     assert state.repository.soft_delete_org("globex", at=datetime.now(UTC)) is False
     retired = state.repository.get_org("globex", include_deleted=True)
     assert retired is not None and retired.deleted_at is not None
+
+
+def test_one_unreadable_machine_roster_entry_does_not_lock_out_every_human(
+    serve_engine: Callable[..., Engine], tmp_path: Path
+) -> None:
+    """`orgs_from_db` builds the model the *human* sign-in path resolves against, so a malformed
+    stored entry that raised would turn every person's login into a denial — and `authz`'s own
+    `except Exception` would report it as a database outage, hiding the real cause."""
+    from sqlalchemy.orm import Session
+
+    from bajutsu.serve.server.models import Org
+
+    state = _state(serve_engine, tmp_path)
+    assert state.repository is not None
+    admin = _admin(state)
+    ops.create_org(state, {"slug": "initech", "name": "Initech"}, actor=admin)
+    ops.update_org_membership(
+        state,
+        "initech",
+        {"members": ["peter"], "allowedRepositories": ["initech/app"]},
+        actor=admin,
+    )
+    # A direct write nothing validated — a rollback, a future writer, an operator with psql.
+    engine = state.repository._engine  # type: ignore[attr-defined]
+    with Session(engine) as session:
+        row = session.get(Org, "initech")
+        assert row is not None
+        row.allowed_repositories = [{"repository": "no-slash"}, "initech/app"]
+        session.commit()
+
+    orgs = orgs_from_db(state.repository)
+    assert orgs["initech"].members == ["peter"]  # the human roster is untouched
+    # The unreadable entry admits nobody; the readable one beside it still works.
+    assert [e.repository for e in orgs["initech"].allowed_repositories] == ["initech/app"]

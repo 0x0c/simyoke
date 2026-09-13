@@ -30,6 +30,7 @@ from bajutsu.serve.helpers import (
     valid_run_id,
 )
 from bajutsu.serve.routes import ROUTES, match_route
+from bajutsu.serve.sessions import MACHINE
 from bajutsu.serve.state import ServeState
 from bajutsu.serve.upload_artifacts import ArtifactKind
 from bajutsu.serve.uploads import (
@@ -56,6 +57,15 @@ _SESSION_COOKIE = "bajutsu_session"
 _OAUTH_STATE_COOKIE = (
     "bajutsu_oauth_state"  # short-lived CSRF state for the OAuth round-trip (7b-2)
 )
+
+
+def _session_cookie(sid: str | None) -> str | None:
+    """The `Set-Cookie` a session-minting endpoint writes, or None when it minted none.
+
+    Shared by the shared-token login and the OIDC exchange (BE-0414): both hand the browser — or
+    the pipeline's cookie jar — an opaque id, never the credential it was exchanged for.
+    """
+    return None if sid is None else f"{_SESSION_COOKIE}={sid}; HttpOnly; SameSite=Strict; Path=/"
 
 
 class _StdlibCtx:
@@ -227,13 +237,32 @@ def _make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:  # noqa: C
             if state.auth.token is None:
                 return True
             path = urlparse(self.path).path
-            if gate.is_open(self.command, path):
+            if gate.is_open(self.command, path, oidc=state.auth.oidc is not None):
                 return True
             if self._authorized():
-                # Authenticated. For an OAuth session (an identity) with a database wired, enforce
-                # the user's role on mutating endpoints (BE-0015 7c-2). A token/Bearer request has
-                # no identity and stays full-access (the operator credential).
-                login = self._actor()
+                # Authenticated — but as which of the three caller shapes? A machine session
+                # (BE-0414) carries an identity like a human one, so it would otherwise fall into
+                # the role gate below and be read as a user with no row, i.e. a viewer. Its own
+                # gate runs first and unconditionally, with or without a database: the role gate's
+                # "DB-less = full access" would be exactly the wrong default to inherit here.
+                # One read, not two: asking separately for the kind and then the identity lets a
+                # session that stops validating in between answer None to both, and a caller that
+                # is neither machine nor human is served as the shared-token shape — full access.
+                principal = gate.principal_for(state.auth, self._session_value())
+                is_machine = principal is not None and principal.kind == MACHINE
+                if is_machine and gate.forbidden_for_machine(self.command, path):
+                    length = int(self.headers.get("Content-Length") or 0)
+                    if length:
+                        self.rfile.read(length)
+                    self._json({"error": "forbidden"}, 403)
+                    return False
+                # For an OAuth session (an identity) with a database wired, enforce the user's role
+                # on mutating endpoints (BE-0015 7c-2). A token/Bearer request has no identity and
+                # stays full-access (the operator credential). A machine principal never reaches
+                # that gate — the allowlist above is the whole of what governs it.
+                login = (
+                    None if is_machine else (principal.identity if principal is not None else None)
+                )
                 if (
                     login is not None
                     and state.repository is not None
@@ -389,6 +418,9 @@ def _make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:  # noqa: C
             # boundary and turned into a JSON 500 (BE-0264).
             if path == "/api/login":
                 self._post_login(body)
+                return
+            if path == gate.OIDC_EXCHANGE_PATH:
+                self._post_oidc_exchange(body)
                 return
             self._dispatch_registry("POST", path, body)
 
@@ -564,12 +596,18 @@ def _make_handler(state: ServeState) -> type[BaseHTTPRequestHandler]:  # noqa: C
             POST body (never a URL); on success the response sets an HttpOnly, SameSite cookie
             holding an opaque session id — so the token itself is never stored in the browser."""
             payload, status, sid = ops.login(state, str(body.get("token", "") or ""))
-            cookie = (
-                f"{_SESSION_COOKIE}={sid}; HttpOnly; SameSite=Strict; Path=/"
-                if sid is not None
-                else None
+            self._json(payload, status, cookie=_session_cookie(sid))
+
+        def _post_oidc_exchange(self, body: dict[str, Any]) -> None:
+            """Exchange a CI job's OIDC token for a machine session cookie (BE-0414 unit 1).
+
+            Bespoke beside `_post_login` and for the same reason: it writes a `Set-Cookie` and
+            needs the parsed body. The token travels in the body, never a URL, like the shared
+            token before it."""
+            payload, status, sid = ops.oidc_exchange(
+                state, str(body.get("token", "") or ""), str(body.get("org", "") or "")
             )
-            self._json(payload, status, cookie=cookie)
+            self._json(payload, status, cookie=_session_cookie(sid))
 
         def _oauth_login(self) -> None:
             """Begin GitHub OAuth (BE-0015 7b-2): redirect to GitHub's authorize URL and stash the

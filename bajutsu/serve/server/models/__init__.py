@@ -11,6 +11,7 @@ from ._shared import _JSON as _JSON
 from .audit_log import AuditLog
 from .base import Base
 from .job_record import JobRecord
+from .oidc_jti import OidcJti
 from .org import Org
 from .provider_settings_row import ProviderSettingsRow
 from .run import Run
@@ -24,6 +25,7 @@ __all__ = [
     "AuditLog",
     "Base",
     "JobRecord",
+    "OidcJti",
     "Org",
     "ProviderSettingsRow",
     "Run",

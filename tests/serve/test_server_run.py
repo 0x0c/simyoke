@@ -1100,3 +1100,86 @@ def test_sse_route_delivers_keepalive_over_the_wire(
         server.should_exit = True
         thread.join(timeout=5)
         assert not thread.is_alive(), "uvicorn server did not shut down"
+
+
+def _delenv_oidc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the premise rather than inherit it, the same reason `_delenv_oauth` exists: a maintainer
+    who exports these for their own deployment would otherwise silently falsify a "no warning" case."""
+    for var in (
+        "BAJUTSU_OIDC_AUDIENCE",
+        "BAJUTSU_OIDC_PROVIDER",
+        "BAJUTSU_OIDC_ISSUER",
+        "BAJUTSU_OIDC_MAX_TOKEN_AGE",
+        "BAJUTSU_OIDC_SESSION_TTL",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _server_state(tmp_path: Path) -> srv.ServeState:
+    _scn, cfg, runs = project(tmp_path)
+    return srv._build_state(
+        runs_dir=runs,
+        config=cfg,
+        scenarios_dir=None,
+        root=tmp_path,
+        baselines_dir=None,
+        max_concurrent=4,
+        token=None,
+        backend="server",
+    )
+
+
+def test_build_state_warns_when_oidc_is_configured_without_a_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The OIDC exchange spends each token's `jti` in the database to make single-use hold across
+    replicas, so with none configured it refuses every exchange. `docs/self-hosting.md` promises
+    the operator hears that at boot rather than one failed pipeline run at a time (BE-0414)."""
+    monkeypatch.setenv("BAJUTSU_SERVER_STORE", "s3://bkt")
+    monkeypatch.delenv("BAJUTSU_DATABASE_URL", raising=False)
+    _delenv_oauth(monkeypatch)
+    _delenv_oidc(monkeypatch)
+    monkeypatch.setenv("BAJUTSU_OIDC_AUDIENCE", "https://bajutsu.example.com")
+
+    state = _server_state(tmp_path)
+
+    # Keyed on `check=`, not the message text, for the reason `ServeState.startup_warnings`'
+    # own comment gives: an alert keys on the stable discriminator, and the prose can reword.
+    assert any(check == "oidc_without_database" for check, _msg in state.startup_warnings)
+    assert state.auth.oidc is not None  # configured, just unusable until a database appears
+
+
+def test_build_state_warns_when_oidc_is_configured_without_joserfc(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Verification imports `joserfc` lazily, so a deployment missing the `oauth` extra would
+    otherwise meet it as a 500 per exchange with no `oidc.denied` behind it (BE-0414)."""
+    monkeypatch.setenv("BAJUTSU_SERVER_STORE", "s3://bkt")
+    _delenv_oauth(monkeypatch)
+    _delenv_oidc(monkeypatch)
+    monkeypatch.setenv("BAJUTSU_OIDC_AUDIENCE", "https://bajutsu.example.com")
+    monkeypatch.setattr(srv, "_joserfc_installed", lambda: False)
+
+    state = _server_state(tmp_path)
+
+    assert any(check == "oidc_without_joserfc" for check, _msg in state.startup_warnings)
+    assert any(
+        "uv sync --extra oauth" in msg
+        for check, msg in state.startup_warnings
+        if check == "oidc_without_joserfc"
+    ), "the warning must name the fix, not just the symptom"
+
+
+def test_build_state_is_quiet_about_oidc_when_none_is_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No expected audience means the caller shape is off, which is the ordinary deployment — it
+    must not be warned at about a feature it never asked for."""
+    monkeypatch.setenv("BAJUTSU_SERVER_STORE", "s3://bkt")
+    _delenv_oauth(monkeypatch)
+    _delenv_oidc(monkeypatch)
+
+    state = _server_state(tmp_path)
+
+    assert state.auth.oidc is None
+    assert not [c for c, _m in state.startup_warnings if c.startswith("oidc_")]

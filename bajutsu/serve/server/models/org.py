@@ -29,6 +29,15 @@ class Org(Base):
     github_orgs: Mapped[list[str] | None] = mapped_column(_JSON, default=None)
     github_teams: Mapped[list[str] | None] = mapped_column(_JSON, default=None)
     editor_teams: Mapped[list[str] | None] = mapped_column(_JSON, default=None)
+    # The machine roster (BE-0414 unit 2): the repositories whose CI jobs may exchange an OIDC
+    # token for a machine session acting as this org. A column rather than config-only, for the
+    # reason the membership columns above are: once a database is wired `orgs_from_db` is the org
+    # model, and the exchange requires a database — so a config-only field would be permanently
+    # empty on exactly the deployments that can use it. Every writer dumps the validated model, so
+    # a stored entry is always the object form — the bare `"<owner>/<repo>"` string is a config
+    # spelling, never a stored one — and it is parsed back on read rather than trusted
+    # (`orgs._stored_repositories`).
+    allowed_repositories: Mapped[list[Any] | None] = mapped_column(_JSON, default=None)
     # When this row's membership was seeded from a bound config's `orgs:` entry — the per-row
     # cutover marker (BE-0375). Null means "not yet seeded"; set means the database owns this org's
     # membership from then on, so a later `orgs:` edit can never overwrite what an admin set. A

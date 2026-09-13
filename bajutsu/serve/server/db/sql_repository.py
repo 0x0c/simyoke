@@ -22,6 +22,10 @@ if TYPE_CHECKING:
 # worker's heartbeat interval must stay well under the timeout so a live long run is never reclaimed.
 DEFAULT_LEASE_TIMEOUT_SECONDS = 120.0
 
+# The clock skew a spent-`jti` row must outlive, matching `bajutsu.serve.oidc`'s own allowance —
+# duplicated as a constant rather than imported so this module stays free of the OIDC one.
+_REPLAY_SKEW_SECONDS = 60
+
 
 class SqlRepository:
     """A SQLAlchemy-backed `Repository`. Works against any engine SQLAlchemy supports — SQLite on
@@ -253,6 +257,7 @@ class SqlRepository:
         github_orgs: list[str],
         github_teams: list[str],
         editor_teams: list[str],
+        allowed_repositories: list[dict[str, Any]] | None = None,
     ) -> bool:
         from sqlalchemy.orm import Session
 
@@ -264,6 +269,8 @@ class SqlRepository:
                 return False
             row.members, row.github_orgs = members, github_orgs
             row.github_teams, row.editor_teams = github_teams, editor_teams
+            if allowed_repositories is not None:  # None = leave the machine roster alone
+                row.allowed_repositories = allowed_repositories
             if row.membership_seeded_at is None:
                 # An admin can reach a row the backfill never marked — one `ensure_org` created at
                 # sign-in, one predating the migration, or one left unseeded because the config
@@ -284,6 +291,7 @@ class SqlRepository:
         github_orgs: list[str],
         github_teams: list[str],
         editor_teams: list[str],
+        allowed_repositories: list[dict[str, Any]] | None = None,
     ) -> bool:
         from sqlalchemy.exc import IntegrityError
         from sqlalchemy.orm import Session
@@ -307,6 +315,7 @@ class SqlRepository:
                         github_orgs=github_orgs,
                         github_teams=github_teams,
                         editor_teams=editor_teams,
+                        allowed_repositories=allowed_repositories,
                         membership_seeded_at=seeded_at,
                     )
                 )
@@ -328,8 +337,44 @@ class SqlRepository:
                     return True
             row.members, row.github_orgs = members, github_orgs
             row.github_teams, row.editor_teams = github_teams, editor_teams
+            if allowed_repositories is not None:  # None leaves it alone, as `set_org_membership`
+                row.allowed_repositories = allowed_repositories
             row.membership_seeded_at = seeded_at
             session.commit()
+            return True
+
+    def spend_oidc_jti(self, jti: str, *, expires_at: datetime) -> bool:
+        from sqlalchemy import delete
+        from sqlalchemy.exc import IntegrityError
+        from sqlalchemy.orm import Session
+
+        from bajutsu.serve.server.models import OidcJti
+
+        # Swept behind the same clock-skew allowance the lifetime checks grant (`oidc`'s
+        # `_CLOCK_SKEW_SECONDS`), not behind `now`. A token stays acceptable while `exp >= now -
+        # skew`, so sweeping at `now` would drop a row while the token it names could still be
+        # presented — leaving single-use resting on the exchange's separate born-dead guard
+        # instead of on this table. Keeping the row for the whole window the token is live makes
+        # the table sufficient on its own.
+        swept_before = datetime.now(UTC) - timedelta(seconds=_REPLAY_SKEW_SECONDS)
+        with Session(self._engine) as session:
+            # Swept here rather than on a schedule: an exchange is the only writer, so the table
+            # cannot grow between two of them, and this keeps the mechanism in one place. It
+            # commits on its own, ahead of the insert: sharing the insert's transaction would let
+            # the rollback below discard the sweep too, and under a replay flood — where every
+            # call conflicts — the table would then never shrink at all.
+            session.execute(delete(OidcJti).where(OidcJti.expires_at < swept_before))
+            session.commit()
+            session.add(OidcJti(id=jti, expires_at=expires_at))
+            try:
+                session.commit()
+            except IntegrityError:
+                # The primary key is the whole single-use rule: whoever inserted first spent the
+                # token, and this caller — a replay, or the losing side of a race between two
+                # replicas — is refused. The table carries no other constraint that could reject
+                # an insert, so a duplicate key is the only thing this can mean.
+                session.rollback()
+                return False
             return True
 
     def soft_delete_org(self, org_id: str, *, at: datetime) -> bool:

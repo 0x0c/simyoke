@@ -7,8 +7,9 @@ orgs/users/audit_log are tested elsewhere in this file (7b/7c)."""
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _shared import StubArtifactStore
@@ -394,3 +395,118 @@ def test_post_completion_logbus_final_returns_result(serve_engine: Callable[...,
     import json
 
     assert json.loads(final)["ok"] is True
+
+
+# --- BE-0414 unit 1: the OIDC replay cache, in the shared system of record --------------------
+
+
+def _jti_repo(serve_engine: Callable[..., Engine]) -> tuple[Any, Engine]:
+    from bajutsu.serve.server.db import SqlRepository
+    from bajutsu.serve.server.models import Base
+
+    engine = serve_engine()
+    Base.metadata.create_all(engine)
+    return SqlRepository(engine), engine
+
+
+def test_a_jti_is_spent_once(serve_engine: Callable[..., Engine]) -> None:
+    repository, _engine = _jti_repo(serve_engine)
+    expires = datetime.now(UTC) + timedelta(minutes=5)
+    assert repository.spend_oidc_jti("jti-1", expires_at=expires) is True
+    assert repository.spend_oidc_jti("jti-1", expires_at=expires) is False
+    assert repository.spend_oidc_jti("jti-2", expires_at=expires) is True
+
+
+def test_single_use_holds_across_replicas(serve_engine: Callable[..., Engine]) -> None:
+    """The reason this is a table and not a per-process cache: a hosted control plane is several
+    replicas over one database, so a captured token replayed at the second must still be refused."""
+    from bajutsu.serve.server.db import SqlRepository
+
+    first, engine = _jti_repo(serve_engine)
+    second = SqlRepository(engine)  # a separate replica against the same database
+    expires = datetime.now(UTC) + timedelta(minutes=5)
+    assert first.spend_oidc_jti("jti-1", expires_at=expires) is True
+    assert second.spend_oidc_jti("jti-1", expires_at=expires) is False
+
+
+def test_spending_sweeps_rows_no_token_can_still_use(
+    serve_engine: Callable[..., Engine],
+) -> None:
+    """The table stays bounded with no schedule of its own — but a row is kept for as long as the
+    token it names could still be presented, which is `exp` plus the clock skew the lifetime
+    checks allow. Sweeping at `now` instead would drop a row while its token was still acceptable,
+    leaving single-use resting on the exchange's separate born-dead guard rather than on this
+    table."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from bajutsu.serve.server.models import OidcJti
+
+    repository, engine = _jti_repo(serve_engine)
+    now = datetime.now(UTC)
+    repository.spend_oidc_jti("long-gone", expires_at=now - timedelta(minutes=5))
+    repository.spend_oidc_jti("just-expired", expires_at=now - timedelta(seconds=1))
+    repository.spend_oidc_jti("live", expires_at=now + timedelta(minutes=5))
+    with Session(engine) as session:
+        kept = sorted(r.id for r in session.scalars(select(OidcJti)))
+    assert kept == ["just-expired", "live"]
+
+
+def test_a_just_expired_token_still_cannot_be_replayed(
+    serve_engine: Callable[..., Engine],
+) -> None:
+    """The property the sweep window exists for: a token inside the clock-skew allowance is still
+    refused a second time by this table alone, with no help from any caller-side guard."""
+    repository, _engine = _jti_repo(serve_engine)
+    just_expired = datetime.now(UTC) - timedelta(seconds=1)
+    assert repository.spend_oidc_jti("j", expires_at=just_expired) is True
+    assert repository.spend_oidc_jti("j", expires_at=just_expired) is False
+
+
+def test_seeding_without_a_machine_roster_leaves_the_column_alone(
+    serve_engine: Callable[..., Engine],
+) -> None:
+    """Both membership writers now read `allowed_repositories=None` the same way — "leave it" —
+    so the seam cannot mean opposite things depending on which one a caller reached."""
+    repository, _engine = _jti_repo(serve_engine)
+    repository.ensure_org("acme", slug="acme", name="Acme")
+    assert repository.set_org_membership(
+        "acme",
+        members=["alice"],
+        github_orgs=[],
+        github_teams=[],
+        editor_teams=[],
+        allowed_repositories=[{"repository": "acme/app"}],
+    )
+    # A later seed that names no roster must not wipe the one an admin set. The row is already
+    # marked seeded, so this is a no-op overall — the unseeded path is asserted below.
+    assert (
+        repository.seed_org_membership(
+            "acme",
+            slug="acme",
+            name="Acme",
+            members=["bob"],
+            github_orgs=[],
+            github_teams=[],
+            editor_teams=[],
+        )
+        is False
+    )
+    org = repository.get_org("acme")
+    assert org is not None
+    assert org.allowed_repositories == [{"repository": "acme/app"}]
+
+    # And on a genuinely unseeded row, omitting it leaves the column null rather than writing one.
+    repository.ensure_org("globex", slug="globex", name="Globex")
+    assert repository.seed_org_membership(
+        "globex",
+        slug="globex",
+        name="Globex",
+        members=["carol"],
+        github_orgs=[],
+        github_teams=[],
+        editor_teams=[],
+    )
+    seeded = repository.get_org("globex")
+    assert seeded is not None
+    assert seeded.members == ["carol"] and seeded.allowed_repositories == []

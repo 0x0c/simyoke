@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
+from bajutsu.serve.sessions import Principal
 from bajutsu.serve.state import SessionManager
 
 # Standard hardening headers on every response (BE-0051): block MIME sniffing and cross-origin
@@ -40,6 +41,7 @@ _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 # UI can load, the OAuth round-trip, and the login endpoint itself.
 _OPEN_GET_PATHS = ("/", "/index.html", "/api/oauth/login", "/api/oauth/callback")
 _LOGIN_PATH = "/api/login"
+OIDC_EXCHANGE_PATH = "/api/oidc/exchange"
 _WORKER_PREFIX = "/api/worker/"
 
 
@@ -100,12 +102,20 @@ def csrf_ok(origin: str | None, host_header: str) -> bool:
     return urlparse(origin).netloc == host_header
 
 
-def is_open(method: str, path: str) -> bool:
+def is_open(method: str, path: str, *, oidc: bool = False) -> bool:
     """Whether this request may skip authentication even when a token is configured — the login UI,
     the OAuth round-trip, the login endpoint itself, and the frontend ES-module routes (BE-0247), so
-    the login UI's JS loads before auth exactly as the old inlined index script did."""
-    return (method == "GET" and (path in _OPEN_GET_PATHS or _is_frontend_module(path))) or (
-        method == "POST" and path == _LOGIN_PATH
+    the login UI's JS loads before auth exactly as the old inlined index script did.
+
+    The OIDC exchange joins them when *oidc* says this deployment configured one (BE-0414): it is
+    the machine's way *in*, so it can require no prior serve credential — only a verifiable OIDC
+    token, which it checks itself. A deployment with no expected audience leaves it closed, the
+    same fail-closed rule that disables the caller shape everywhere else.
+    """
+    return (
+        (method == "GET" and (path in _OPEN_GET_PATHS or _is_frontend_module(path)))
+        or (method == "POST" and path == _LOGIN_PATH)
+        or (oidc and method == "POST" and path == OIDC_EXCHANGE_PATH)
     )
 
 
@@ -136,3 +146,38 @@ def actor_for(auth: SessionManager, session_value: str | None) -> str | None:
     """The GitHub login bound to this request's session, if any — used to attribute audit entries
     (BE-0015 7c). None for a token/Bearer request or no session."""
     return auth.sessions.identity(session_value) if session_value else None
+
+
+def principal_for(auth: SessionManager, session_value: str | None) -> Principal | None:
+    """Who this request's session belongs to, in **one** read (BE-0414).
+
+    A machine session authenticates exactly like a human one — `is_authorized` already accepts any
+    valid session cookie — so the gate has to ask which it is holding before deciding *which* gate
+    governs it. Reading the kind the store recorded, rather than the shape of the identity string,
+    is what keeps a human session from ever reaching the machine branch.
+
+    The whole principal comes back rather than only a machine one, so a backend derives both the
+    kind and the identity from a single snapshot. Asking twice opened a window: between a
+    `machine_principal` read and a separate `actor_for` read, a session whose short time-to-live
+    crossed — or which a concurrent org retirement revoked — answers None to both, and a caller
+    that is neither machine nor human falls through to the identity-less shared-token shape, which
+    is full access. One read cannot disagree with itself that way.
+    """
+    return auth.sessions.principal(session_value) if session_value else None
+
+
+def forbidden_for_machine(method: str, path: str) -> bool:  # noqa: ARG001 - see below
+    """Whether a machine principal is refused this request. Today: every request, always.
+
+    BE-0414 unit 1 mints the machine session; unit 3 is what gives it an endpoint allowlist —
+    publishing the three artifact kinds, the exists-probe, dispatching a run and reading its org's
+    runs — and the *rank* gate is no substitute in the meantime. `forbidden_for_role` would read a
+    machine identity as a user with no row and default it to viewer, handing a pipeline read access
+    to the `default` org through `org_of`. So until that allowlist lands, a machine session is
+    refused everywhere the gate runs at all: the exchange is testable end to end and nothing it
+    mints can reach a thing. "Where the gate runs" is the caveat — both backends skip it entirely
+    with no shared token configured, but that is the deployment already serving every endpoint
+    unauthenticated, so a machine session is not what grants access there. Unit 3 replaces this
+    body with the allowlist; both backends already route through here.
+    """
+    return True

@@ -18,6 +18,7 @@ from bajutsu.serve.baselines import BaselineStore, LocalBaselineStore
 from bajutsu.serve.executor import LocalExecutor, RunExecutor
 from bajutsu.serve.helpers import load_serve_config_file
 from bajutsu.serve.logbus import InMemoryLogBus, LogBus
+from bajutsu.serve.oidc import JwksCache
 from bajutsu.serve.orgs import targets_for_org
 from bajutsu.serve.scenarios import LocalScenarioStore, ScenarioStore
 from bajutsu.serve.secrets import EnvSecretStore, SecretStore
@@ -181,6 +182,12 @@ class ServeState:
     # keys on `check=` rather than substring-matching *msg*, which can reword out from under it. Empty
     # on local serve (BE-0352).
     startup_warnings: tuple[tuple[str, str], ...] = ()
+    # The OIDC issuer's signing keys, fetched on the first exchange and re-read on a bounded
+    # schedule (BE-0414 unit 1). Lives here, not in the operation, because a cache rebuilt per
+    # request bounds nothing: the refresh floor is what keeps a flood of unknown key ids costing
+    # one outbound fetch per interval instead of one per call. None until the first exchange, and
+    # on every deployment that configures no OIDC audience.
+    oidc_keys: JwksCache | None = None
     # Per-org store factory (BE-0015 multi-tenancy). None on local serve (one tenant); a server
     # backend sets a closure that builds object stores prefixed for the given org. `for_org` falls
     # back to the default stores when unset, so local behavior is unchanged.

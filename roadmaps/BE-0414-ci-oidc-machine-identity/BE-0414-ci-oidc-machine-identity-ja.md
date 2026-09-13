@@ -7,8 +7,9 @@
 |---|---|
 | 提案 | [BE-0414](BE-0414-ci-oidc-machine-identity-ja.md) |
 | 提案者 | [@paihu](https://github.com/paihu) |
-| 状態 | **提案** |
+| 状態 | **実装中** |
 | トラッキング Issue | [検索](https://github.com/bajutsu-e2e/bajutsu/issues?q=is%3Aissue+label%3Aroadmap-tracking+in%3Atitle+"BE-0414") |
+| 実装 PR | [#1986](https://github.com/bajutsu-e2e/bajutsu/pull/1986)（単位1〜2） |
 | トピック | Web UI のホスティング |
 | 関連 | [BE-0313](../BE-0313-github-org-team-rbac/BE-0313-github-org-team-rbac-ja.md)、[BE-0051](../BE-0051-serve-hardening-for-hosting/BE-0051-serve-hardening-for-hosting-ja.md)、[BE-0015](../BE-0015-web-ui-public-hosting/BE-0015-web-ui-public-hosting-ja.md) |
 <!-- /BE-METADATA -->
@@ -493,7 +494,7 @@ nullを許すforeign keyです（`bajutsu/serve/server/models/audit_log.py`）�
 > 作業分解（作業の単位ごとに 1 つ）に対応し、ログには変更内容と時期（古い順）を PR へのリンクと
 > ともに記録します。
 
-- [ ] 単位1 — `POST /api/oidc/exchange`でトークンを機械セッションに交換します。発行者・`kid`の
+- [x] 単位1 — `POST /api/oidc/exchange`でトークンを機械セッションに交換します。発行者・`kid`の
       更新頻度を抑えたキャッシュ付きJWKS・RS256に固定したアルゴリズムの許可リスト・デプロイが設定
       する`aud`（未設定なら閉じる方向で失敗）・有効期間を検証します。`Repository`という接続点を
       通じてレプリカ間で共有する`jti`再送防止（`jti`を持たないトークンの拒否を含む）、
@@ -502,7 +503,7 @@ nullを許すforeign keyです（`bajutsu/serve/server/models/audit_log.py`）�
       テーブルのためのAlembicのrevision、`oauth` extraへ直接宣言
       する`joserfc`、そして`gate.py`を汚さないよう専用の遅延importモジュールに保つその検証を含み
       ます。
-- [ ] 単位2 — `OrgConfig`への`allowedRepositories`。交換のリクエストが名指したorgについて、個別の
+- [x] 単位2 — `OrgConfig`への`allowedRepositories`。交換のリクエストが名指したorgについて、個別の
       クレームで照合します。任意で項目ごとの`environment`/`ref`/`job_workflow_ref`により絞り込みます
       （`environment`はクレームがない場合も拒否）。
 - [ ] 単位3 — 機械セッション（身元は`repo:<owner>/<repo>`で取り消し可能）と、
@@ -514,6 +515,36 @@ nullを許すforeign keyです（`bajutsu/serve/server/models/audit_log.py`）�
       広げること。
 - [ ] 単位4 — レプリカをまたぐ`jti`再送テスト・データベースを持たないデプロイでの交換拒否・
       import guardの`joserfc`チェックを含む各接続点のテストと、self-hostingのドキュメント。
+
+ログ：
+
+- [#1986](https://github.com/bajutsu-e2e/bajutsu/pull/1986) — 単位1と単位2です。
+  `POST /api/oidc/exchange` と、その背後の検証（`bajutsu/serve/oidc.py`）を追加しました。更新頻度を
+  抑えたキャッシュ付きのJWKS探索、RS256に固定したアルゴリズムの許可リスト、60秒のずれを許容する
+  発行者・`aud`・有効期間の検証、serve側の経過時間の上限、`iat`と`jti`の必須化、そして`Repository`
+  という接続点を通じて使用済みにする`jti`です。これでレプリカをまたいで再送を拒否できます。
+  `SessionStore` には、3つの実装すべてにセッションごとの有効期限と org、そしてセッションの種別を
+  足しました。
+  読み出し時の絞り込みを1箇所にまとめた`Principal`も加えています。`OrgConfig`には
+  `allowedRepositories`を追加し、個別のクレームとの完全一致で照合します。項目ごとの
+  `environment`／`ref`／`workflowRef`による絞り込みも任意で書けます。Alembicのrevision 0020が、
+  セッションの2列、orgの1列、`oidc_jti`テーブルを追加します。
+
+  この項目の記述から3点はずれています。いずれも字義どおりでは動かないためです。
+  `allowedRepositories`は設定のフィールドだけでなくデータベースの列も必要でした。データベースを
+  繋いだデプロイは`orgs_from_db`からorgモデルを読み、交換はデータベースを必要とするので、設定だけの
+  フィールドでは、まさにこの機能を使えるデプロイでだけ常に空になってしまいます。route を
+  `gate.is_open` に加えるのも単位3ではなくここで行いました。そうしないと単位1に到達できず、テスト
+  もできません。そして、セッションごとの有効期限を保証できないストアで交換を拒否する代わりに、
+  `InMemorySessionStore`自身に有効期限を実装しました。データベースを要求することで同じ絞り込みに
+  達し、コードは少なくて済みます。項目ごとの絞り込みの名前は`job_workflow_ref`ではなく
+  `workflowRef`にしました。他の設定キーと同じcamelCaseで、かつプロバイダに依存しない名前です。
+
+  検証はプロバイダに依存しません。`OidcProvider`はクレーム名の表なので、2つ目のCIプラットフォームは
+  設計のやり直しではなく1エントリの追加で済みます。単位3と単位4は残っているため、発行された
+  マシンセッションは当面すべてのendpointで拒否されます。単位3が置き換える接続点は
+  `gate.forbidden_for_machine`の1箇所だけです。それまでこの全面拒否が、マシンセッションがロール
+  ゲートのviewerというデフォルト値に落ちるのを防ぎます。
 
 ## 参考
 

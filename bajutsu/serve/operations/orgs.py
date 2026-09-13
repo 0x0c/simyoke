@@ -15,9 +15,11 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+from pydantic import ValidationError
+
 from bajutsu.serve import oplog
 from bajutsu.serve.authz import _record_audit
-from bajutsu.serve.orgs import DEFAULT_ORG
+from bajutsu.serve.orgs import DEFAULT_ORG, AllowedRepository
 from bajutsu.serve.state import ServeState
 
 _logger = logging.getLogger(__name__)
@@ -64,12 +66,39 @@ def _string_list(value: Any, field: str) -> tuple[list[str] | None, str | None]:
     return entries, None
 
 
+def _allowed_repositories(body: dict[str, Any]) -> tuple[list[Any] | None, str | None]:
+    """The org's machine roster from *body*, validated, or a reason it is not one (BE-0414 unit 2).
+
+    An absent key returns `(None, None)`: the roster is left as it stands rather than replaced with
+    nothing. The four human fields above take the opposite default deliberately — a caller that
+    predates *this* field would otherwise revoke every pipeline's access to the org and be told the
+    update succeeded, the same silent-strip failure the retired `editorTeam` key is refused over.
+    Sending the key, `[]` included, replaces the roster as one unit like everything else.
+    """
+    if "allowedRepositories" not in body:
+        return None, None
+    value = body["allowedRepositories"]
+    if not isinstance(value, list):
+        return None, "allowedRepositories must be a list"
+    try:
+        # Validated here, not at the exchange: a malformed entry rejected on write is one an admin
+        # can fix, where one stored and rejected on read is a pipeline failing for an invisible
+        # reason. Round-tripped through the model so what lands in the row is the canonical shape.
+        return [
+            AllowedRepository.model_validate(entry).model_dump(by_alias=True) for entry in value
+        ], None
+    except ValidationError as e:
+        return None, f"allowedRepositories is not valid: {e.errors()[0].get('msg', e)}"
+
+
 def list_orgs_view(state: ServeState, *, actor: str | None = None) -> tuple[Any, int]:  # noqa: ARG001  # uniform operation signature
     """Every live org with its membership — the Orgs page's list and the source its edit form fills.
 
-    The rosters themselves, not just their sizes: the membership form replaces all four fields as
-    one unit, so it has to start from the current values or the first save would silently empty
-    what it never showed. Only an admin can reach this (`authz.required_role`), which is the same
+    The rosters themselves, not just their sizes: the membership form replaces the four human
+    fields as one unit, so it has to start from the current values or the first save would silently
+    empty what it never showed. `allowedRepositories` travels with them but is the exception —
+    omitting it on a save leaves it alone (BE-0414 unit 2), so a client that never showed it cannot
+    strip it. Only an admin can reach this (`authz.required_role`), which is the same
     tier that could already read the `orgs:` block through `GET /api/config/content`.
     """
     if state.repository is None:
@@ -83,6 +112,10 @@ def list_orgs_view(state: ServeState, *, actor: str | None = None) -> tuple[Any,
             "githubOrgs": org.github_orgs,
             "githubTeams": org.github_teams,
             "editorTeams": org.editor_teams,
+            # The machine roster travels with them (BE-0414 unit 2), by the same argument the
+            # docstring makes for the human ones: a form that never showed it could not send it
+            # back. Omitting it on a save leaves it alone, so an older client is safe either way.
+            "allowedRepositories": org.allowed_repositories,
             # The fallback an unmatched sign-in resolves to is listed (an admin admitted by the
             # bypass is sitting in it, and hiding that would hide where their own work lands) but is
             # not a tenant: all three mutations refuse it, so the page marks it rather than offering
@@ -134,6 +167,10 @@ def update_org_membership(
 ) -> tuple[Any, int]:
     """Replace an org's ``{members, githubOrgs, githubTeams, editorTeams}`` as one unit.
 
+    ``allowedRepositories`` is the exception (BE-0414 unit 2): omitting the key leaves the machine
+    roster as it stands, and only an explicit list — ``[]`` included — replaces it, so a client
+    that predates the field cannot strip it and be told the update succeeded.
+
     The same granularity a configuration edit already had, rather than per-entry add/remove: an
     admin sees the whole roster and sends back the whole roster, so two concurrent edits can't
     interleave into a membership neither of them asked for. Takes effect on the next sign-in, like
@@ -164,6 +201,9 @@ def update_org_membership(
     editor_teams, invalid = _string_list(body.get("editorTeams"), "editorTeams")
     if invalid is not None:
         return {"error": invalid}, 400
+    allowed_repositories, invalid = _allowed_repositories(body)
+    if invalid is not None:
+        return {"error": invalid}, 400
     if "editorTeam" in body:
         # The retired singular field is refused here, not folded in the way the `orgs:` block's own
         # key is (`OrgConfig._fold_retired_editor_team`). `_string_list` reads a missing `editorTeams`
@@ -172,7 +212,8 @@ def update_org_membership(
         # refusing costs: one request an operator can fix here, every login of the deployment there.
         # Loud rather than normalized, like `_validate_slug` above (determinism first).
         return {"error": "editorTeam is retired; send editorTeams as a list of Teams instead"}, 400
-    # Narrowed by the four error returns above.
+    # Narrowed by the four `_string_list` guards above. `allowed_repositories` is not asserted: None
+    # is its "leave the roster as it stands" value, not a validation failure the guard above caught.
     assert members is not None and github_orgs is not None
     assert github_teams is not None and editor_teams is not None
     if not state.repository.set_org_membership(
@@ -181,6 +222,7 @@ def update_org_membership(
         github_orgs=github_orgs,
         github_teams=github_teams,
         editor_teams=editor_teams,
+        allowed_repositories=allowed_repositories,
     ):
         return {"error": f"no org named {slug!r}"}, 404
     _record_audit(
@@ -191,11 +233,19 @@ def update_org_membership(
         slug,
         # The logins themselves are the point of the entry — "who could sign in as this tenant, from
         # when" is exactly what an audit of a membership change has to answer.
+        # Which repositories may act as this tenant is the same question for a machine that the
+        # logins answer for a person, so it belongs in the entry too — but only when this request
+        # actually set it, or the log would read as a change to a roster nobody touched.
         {
             "members": members,
             "githubOrgs": github_orgs,
             "githubTeams": github_teams,
             "editorTeams": editor_teams,
+            **(
+                {"allowedRepositories": allowed_repositories}
+                if allowed_repositories is not None
+                else {}
+            ),
         },
     )
     return {
@@ -204,6 +254,11 @@ def update_org_membership(
         "githubOrgs": github_orgs,
         "githubTeams": github_teams,
         "editorTeams": editor_teams,
+        **(
+            {"allowedRepositories": allowed_repositories}
+            if allowed_repositories is not None
+            else {}
+        ),
     }, 200
 
 
