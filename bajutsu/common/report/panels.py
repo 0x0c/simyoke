@@ -51,6 +51,16 @@ def _domain_allowed(host: str, domains: list[str]) -> bool:
     return any(host == d.lower() or host.endswith("." + d.lower()) for d in domains)
 
 
+def _video_skip_reason(r: RunResult) -> str | None:
+    """Why no video artifact reached this result, when the run itself disclosed one (BE-0020).
+
+    Distinguishes a scenario a backend simply never records video for (no disclosure — the media
+    area's ordinary "no recording") from one where a recording was expected but lost, e.g. to a
+    mid-run backend crash — so the report says why instead of looking like a plain miss.
+    """
+    return next((sc.reason for sc in r.skipped_captures if sc.kind == "video"), None)
+
+
 def _result_panel(
     r: RunResult,
     definition: dict[str, Any] | None,
@@ -256,5 +266,6 @@ def _scenario_data(
         "source_file": source_file,
         "duration": _fmt_duration(r.duration_s),
         "video": video.name if video else None,
+        "video_note": None if video else _video_skip_reason(r),
         "panels": panels,
     }

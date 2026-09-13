@@ -154,7 +154,18 @@ def test_run_all_fails_a_scenario_that_crashes_every_attempt() -> None:
             release=lambda: None,
         )
 
-    scenarios = [Scenario.model_validate({"name": "a", "steps": [{"tap": {"id": "ok"}}]})]
+    scenarios = [
+        Scenario.model_validate(
+            {
+                "name": "a",
+                # Video is opt-in per scenario (BE-0028); a rule is enough to request it for the
+                # whole scenario regardless of whether its own "on" condition ever fires — this test
+                # is about the disclosure a *requested* recording gets when it is lost to a crash.
+                "capturePolicy": [{"on": {"result": "error"}, "capture": ["video"]}],
+                "steps": [{"tap": {"id": "ok"}}],
+            }
+        )
+    ]
     messages: list[str] = []
     results = run_all(_eff(), scenarios, lease, crash_retries=2, progress=messages.append)
     assert not results[0].ok and leases == 3  # crash_retries=2 → 3 attempts, all crashed
@@ -163,6 +174,139 @@ def test_run_all_fails_a_scenario_that_crashes_every_attempt() -> None:
     # operator watching progress into expecting a fourth attempt that the budget doesn't allow).
     assert "respawning" not in messages[-1]
     assert sum("respawning" in m for m in messages) == 2  # only the 2 attempts that did retry
+    # Every attempt's own recording died with the lease that crashed under it, so no video artifact
+    # ever reaches this result — the gap is disclosed via `skipped_captures` (BE-0020) so the report
+    # says why, instead of showing an empty player with no explanation.
+    video_skips = [c for c in results[0].skipped_captures if c.kind == "video"]
+    assert len(video_skips) == 1
+    assert video_skips[0].reason == results[0].failure
+
+
+def test_run_all_never_discloses_a_missing_video_for_a_scenario_that_never_requested_one() -> None:
+    # `SkippedCapture` means "requested but unavailable" (BE-0020), and video is opt-in per scenario
+    # (BE-0028) — a scenario with no `capturePolicy`/`capture` naming video was never going to record
+    # one, crash or not. The crash-retry loop must stay silent on that ordinary scenario rather than
+    # claiming a recording went missing that no one ever asked for (the sibling test above covers the
+    # opposite case, where video *was* requested).
+    def lease(eff: Effective, scenario: Scenario) -> Lease:
+        return Lease(
+            driver=_crashing_driver(),
+            sink=NullSink(),
+            relaunch=None,
+            control=None,
+            collector=None,
+            release=lambda: None,
+        )
+
+    scenarios = [Scenario.model_validate({"name": "a", "steps": [{"tap": {"id": "ok"}}]})]
+    results = run_all(_eff(), scenarios, lease, crash_retries=1)
+    assert not results[0].ok
+    assert results[0].skipped_captures == []
+
+
+def test_run_all_shows_the_video_recovered_from_a_scenario_that_crashes_every_attempt(
+    tmp_path: Path,
+) -> None:
+    # A crash mid-run does not always kill the recording along with the backend: the crashed step's
+    # own attempt already had a video interval running, and `run_scenario`'s `finally` still finalizes
+    # it before the crash propagates (its own `finally` runs before the exception reaches the pipeline
+    # at all). When that finalize succeeds, the video it recovers must reach the report as a real
+    # player, not the generic "video unavailable" disclosure the sibling test above covers.
+    from bajutsu.common.evidence import FileSink
+    from bajutsu.common.evidence.intervals import Interval
+
+    run_dir = tmp_path / "runs" / "run1"
+    leases = 0
+
+    def lease(eff: Effective, scenario: Scenario) -> Lease:
+        nonlocal leases
+        leases += 1
+        # A fresh file per attempt: `adopt()` relocates (moves) the prestarted file into the run dir
+        # on `stop()`, exactly as a real recorder's own file would be — so each cold-respawned
+        # attempt needs its own, the same way it gets its own fresh recording process in production.
+        video_file = tmp_path / f"crash-{leases}.mp4"
+        video_file.write_bytes(b"clip")
+        return Lease(
+            driver=_crashing_driver(),
+            sink=FileSink(run_dir, prestarted_intervals=[Interval(kind="video", path=video_file)]),
+            relaunch=None,
+            control=None,
+            collector=None,
+            release=lambda: None,
+        )
+
+    scenarios = [
+        Scenario.model_validate(
+            {
+                "name": "a",
+                # Video is opt-in per scenario (BE-0028); a rule is enough to request it for the
+                # whole scenario regardless of whether its own "on" condition ever fires.
+                "capturePolicy": [{"on": {"result": "error"}, "capture": ["video"]}],
+                "steps": [{"tap": {"id": "ok"}}],
+            }
+        )
+    ]
+    results = run_all(_eff(), scenarios, lease, crash_retries=2)
+    assert not results[0].ok and leases == 3  # crash_retries=2 → 3 attempts, all crashed
+    # The recovered recording rides the ordinary artifact list — no "video unavailable" disclosure
+    # alongside a player that is, in fact, showing something.
+    video_arts = [a for a in results[0].artifacts if a.kind == "video"]
+    assert len(video_arts) == 1
+    assert video_arts[0].name == "00-a/scenario.mp4"
+    assert not [c for c in results[0].skipped_captures if c.kind == "video"]
+
+
+def test_run_all_keeps_an_earlier_attempts_recovered_video_past_a_later_bring_up_crash(
+    tmp_path: Path,
+) -> None:
+    # The *last* crash is not necessarily the one that recorded anything: a later attempt can crash
+    # during lease bring-up — before `run_scenario` (and its interval finalize) is ever entered — and
+    # that attempt's own `BackendCrashError.partial_artifacts` stays at its `None` default. Losing an
+    # earlier attempt's already-finalized video to that empty final crash would be the exact silent
+    # discard this feature exists to remove.
+    from bajutsu.common.evidence import FileSink
+    from bajutsu.common.evidence.intervals import Interval
+
+    run_dir = tmp_path / "runs" / "run1"
+    video_file = tmp_path / "attempt1.mp4"
+    video_file.write_bytes(b"clip")
+    leases = 0
+
+    def lease(eff: Effective, scenario: Scenario) -> Lease:
+        nonlocal leases
+        leases += 1
+        if leases == 1:
+            # Crashes mid-step, inside `run_scenario`: its own `finally` finalizes the video before
+            # the exception propagates.
+            return Lease(
+                driver=_crashing_driver(),
+                sink=FileSink(
+                    run_dir, prestarted_intervals=[Interval(kind="video", path=video_file)]
+                ),
+                relaunch=None,
+                control=None,
+                collector=None,
+                release=lambda: None,
+            )
+        # Crashes at bring-up, before `run_scenario` is ever entered — no finalize, no artifacts.
+        raise base.BackendCrashError("runner crashed during the readiness gate (test)")
+
+    scenarios = [
+        Scenario.model_validate(
+            {
+                "name": "a",
+                "capturePolicy": [{"on": {"result": "error"}, "capture": ["video"]}],
+                "steps": [{"tap": {"id": "ok"}}],
+            }
+        )
+    ]
+    results = run_all(_eff(), scenarios, lease, crash_retries=1)
+    assert not results[0].ok and leases == 2  # crash_retries=1 → 2 attempts, both crashed
+    # Attempt 1's recording survives even though attempt 2 (the last crash) recorded nothing.
+    video_arts = [a for a in results[0].artifacts if a.kind == "video"]
+    assert len(video_arts) == 1
+    assert video_arts[0].name == "00-a/scenario.mp4"
+    assert not [c for c in results[0].skipped_captures if c.kind == "video"]
 
 
 def test_run_all_crash_retries_zero_disables_recovery() -> None:
@@ -1047,7 +1191,15 @@ def test_run_all_run_crash_recovery_budget_latch_skips_every_remaining_scenario(
     scenarios = [
         Scenario.model_validate({"name": "a", "steps": [{"tap": {"id": "ok"}}]}),
         Scenario.model_validate({"name": "b", "steps": [{"tap": {"id": "ok"}}]}),
-        Scenario.model_validate({"name": "c", "steps": [{"tap": {"id": "ok"}}]}),
+        Scenario.model_validate(
+            {
+                "name": "c",
+                # Video is opt-in per scenario (BE-0028); requesting it here is what makes the
+                # "never leased, so it's disclosed" assertion below meaningful (BE-0020).
+                "capturePolicy": [{"on": {"result": "error"}, "capture": ["video"]}],
+                "steps": [{"tap": {"id": "ok"}}],
+            }
+        ),
     ]
     results = run_all(
         _eff(), scenarios, lease, clock=clock, crash_retries=5, run_crash_recovery_budget=50.0
@@ -1058,6 +1210,11 @@ def test_run_all_run_crash_recovery_budget_latch_skips_every_remaining_scenario(
     assert "run-level crash-recovery budget" in (results[1].failure or "")
     assert "run-level crash-recovery budget" in (results[2].failure or "")
     assert "never leased" in (results[2].failure or "")
+    # "c" never leased a device, so no recording was ever attempted — disclosed the same way as an
+    # exhausted crash-retry loop, not left to the report's generic "no recording" (BE-0020).
+    video_skips = [c for c in results[2].skipped_captures if c.kind == "video"]
+    assert len(video_skips) == 1
+    assert video_skips[0].reason == results[2].failure
 
 
 def test_run_all_run_crash_recovery_budget_does_not_fail_a_scenario_after_a_slow_but_successful_recovery() -> (

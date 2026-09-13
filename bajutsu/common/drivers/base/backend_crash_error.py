@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class BackendCrashError(RuntimeError):
     """The backend's driver process crashed mid-scenario and could not be recovered in place.
@@ -16,3 +18,17 @@ class BackendCrashError(RuntimeError):
     raise a subclass (e.g. `XcuitestRunnerCrashError`); the pipeline catches this base so the recovery
     stays backend-agnostic (prime directive 3).
     """
+
+    # Filled in by `orchestrator.run_scenario` before this propagates out of a crashed scenario: its
+    # own interval finalize still runs first (in its `finally`), so a video/deviceLog/appTrace
+    # recording that was in flight when the backend died may already be on disk. The crash-retry loop
+    # in `runner.pipeline` reads this back when building the exhausted-retry `RunResult`, so a
+    # recording that *was* captured on the doomed attempt still reaches the report instead of a bare
+    # "unavailable" disclosure. Stays `None` for a crash raised before `run_scenario` was ever
+    # entered (e.g. during lease bring-up) — there was never a recording to recover.
+    #
+    # Typed as `list[Any]` (really `list[evidence.Artifact]`) rather than importing the real type:
+    # `evidence` depends on `drivers.base` (BackendCrashError's own package), never the reverse — the
+    # module-layering `make lint-imports` enforces — so this module cannot name that type at all,
+    # `TYPE_CHECKING` guard or not (import-linter still walks those).
+    partial_artifacts: list[Any] | None = None

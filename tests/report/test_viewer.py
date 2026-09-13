@@ -8,7 +8,7 @@ from pathlib import Path
 from _report import _el, _passing
 
 from bajutsu.common.evidence import Artifact
-from bajutsu.common.orchestrator import RunResult, StepOutcome
+from bajutsu.common.orchestrator import RunResult, SkippedCapture, StepOutcome
 from bajutsu.common.report import html_report
 
 
@@ -52,6 +52,31 @@ def test_html_embeds_scenario_video() -> None:
     # trailing space) is not enough on its own — the inlined stylesheet mentions "<video>" in a
     # comment on every page, video or not.
     assert "<video " not in html_report("run9", [_passing()])
+
+
+def test_html_discloses_why_the_video_is_missing_on_a_backend_crash() -> None:
+    # A scenario whose backend crashed mid-run and never recovered carries no video artifact
+    # (the recording died with the lease), but the pipeline discloses the gap as a `SkippedCapture`
+    # (BE-0020) — the report must say why the player is empty, not fall back to the generic
+    # "no recording" it shows for a scenario that never captures video at all.
+    r = RunResult(
+        scenario="s1",
+        ok=False,
+        steps=[],
+        expect_results=[],
+        failure="backend crashed mid-run and did not recover across 2 attempts: boom",
+        skipped_captures=[
+            SkippedCapture(
+                kind="video",
+                reason="backend crashed mid-run and did not recover across 2 attempts: boom",
+            )
+        ],
+    )
+    out = html_report("run9", [r])
+    assert "<video " not in out
+    assert "video unavailable: backend crashed mid-run and did not recover" in out
+    # The same disclosure also lands in the Environment tab's "skipped evidence" table (BE-0020).
+    assert "skipped evidence" in out
 
 
 def test_html_step_rows_carry_video_offset() -> None:
