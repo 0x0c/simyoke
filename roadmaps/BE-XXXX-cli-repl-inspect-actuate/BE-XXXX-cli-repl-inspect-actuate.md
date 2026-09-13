@@ -72,12 +72,11 @@ Ahead of that launch, `repl` brings the target's own server up where the config 
 `run`, `record`, `crawl`, and `audit` already share, and stops it on exit through `atexit` the way
 `record` and `crawl` do. Without that step a web target serving its `baseUrl` from `launchServer`
 opens the browser on a host that is not listening, and every `tree` reads the error page.
-`--headed`/`--no-headed` and `--browser` are web-only, reusing the shared `_with_headed` helper
-`record`, `crawl`, and `run` already call and the `_resolve_browser` helper `record` and `run`
-call (`bajutsu/cli/_shared.py`) — `crawl` exposes no `--browser` — and matter for this shell in
-particular: a headless browser leaves an
-operator with no screen to watch change. On launch, `repl` prints the resolved backend and target,
-then a `bajutsu>` prompt.
+`--headed`/`--no-headed` and `--browser` are web-only. Both reuse a shared helper from
+`bajutsu/cli/_shared.py`: `_with_headed`, which `record`, `crawl`, and `run` already call, and
+`_resolve_browser`, which `record` and `run` call (`crawl` exposes no `--browser`). They matter for
+this shell in particular, because a headless browser leaves an operator with no screen to watch
+change. On launch, `repl` prints the resolved backend and target, then a `bajutsu>` prompt.
 
 The v1 command set stays small and id-first:
 
@@ -148,10 +147,13 @@ own handlers are tested, so the new module clears the per-file coverage floor
   id resolves, and it leaves no path for acting on one directly from a terminal, with no browser
   tab and no editor open — the narrower need this item exists for.
 - **Route `repl`'s `tap` through `run`'s `_tap_with_recovery`.** Rejected for v1: surfacing the
-  `ElementNotTappable` that `base.raise_if_covered` raises, naming the covering element, is the
-  more useful answer while diagnosing a selector; an operator who wants the recovery writes the
-  explicit `scroll` step in the scenario and taps there. The cost is that `repl` reports a failure where `run` would
-  recover, so the two can disagree on a covered target — the gap *Detailed design* calls out.
+  driver's own `ElementNotTappable` is the more useful answer while diagnosing a selector, though
+  what it names varies by backend — adb, the live XCUITest route, and `FakeDriver` name the covering
+  element through `base.raise_if_covered` and the web backend names it through its own hit result,
+  while the XCUITest Simulator driver reports only `element resolved but not hittable`; an operator
+  who wants the recovery writes the explicit `scroll` step in the scenario and taps there. The cost
+  is that `repl` reports a failure where `run` would recover, so the two can disagree on a covered
+  target — the gap *Detailed design* calls out.
 - **Add a "manual mode" flag to `record` instead of a new command.** Rejected: `record`'s loop is
   built around `ClaudeAgent` proposing actions from a screenshot, and it always ends by writing a
   scenario. Bolting a human-typed command path onto that loop would tangle an AI-driven path and a
