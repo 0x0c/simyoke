@@ -21,7 +21,5 @@ class _DrainCarry:
     that replaced it drops its own reference.
     """
 
-    drained: base.DrainedInterruptions = field(
-        default_factory=lambda: base.DrainedInterruptions(tapped=[], declined=[])
-    )
+    drained: base.DrainedInterruptions = field(default_factory=base.DrainedInterruptions.empty)
     is_current: bool = False

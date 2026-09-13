@@ -300,5 +300,5 @@ def test_manifest_records_dismissed_alerts() -> None:
     )
     m = manifest_dict("run1", [r])
     scenario = _scenarios(m)[0]
-    assert scenario["steps"][0]["alerts"] == [{"label": "Not Now"}]
-    assert scenario["expect_alerts"] == [{"label": "Allow"}]
+    assert scenario["steps"][0]["alerts"] == [{"label": "Not Now", "kind": "alert"}]
+    assert scenario["expect_alerts"] == [{"label": "Allow", "kind": "alert"}]

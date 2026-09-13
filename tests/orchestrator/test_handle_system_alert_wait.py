@@ -300,6 +300,25 @@ def test_the_wait_records_but_does_not_finish_on_a_monitor_tap_for_a_different_a
     assert not [a for a in driver.actions if a[0] == "handle_system_alert"]
 
 
+def test_the_wait_records_a_banner_swiped_away_mid_wait_without_finishing_on_it() -> None:
+    # This is the one drain site in the codebase that bypasses the `drain_interruptions()` helper
+    # and reads `driver.drain_interruptions()` directly, so it has to fold `drained.banners` into
+    # `alerts` on its own — a banner can never be `sel`'s own alert (BE-0416), so without this the
+    # drain here would consume it from the store and the end-of-step drain would find nothing left.
+    driver = FakeDriver([])
+    driver.banners_to_drain = ["Ready for Apple Intelligence"]
+    alerts: list[AlertEvent] = []
+
+    ok, reason = wait_for_system_alert(
+        driver, {"label": "Allow"}, 0.5, _LogicalClock(), alerts=alerts
+    )
+
+    assert not ok
+    assert "no system alert appeared" in reason  # sel's own prompt never appeared
+    assert alerts == [AlertEvent(label="Ready for Apple Intelligence", kind="notificationBanner")]
+    assert not [a for a in driver.actions if a[0] == "handle_system_alert"]
+
+
 def test_the_wait_fails_on_an_undeclared_interruption_the_monitor_declined_mid_wait() -> None:
     # A different alert interrupted a query during this same wait and no rule identified it — the
     # monitor declined it, and that is a fact the run must not swallow (BE-0406 Unit 2b), even

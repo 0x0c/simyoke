@@ -197,6 +197,33 @@ The CLI `--system-alert-handling` / `--no-system-alert-handling` flag **override
 single run, between the scenario and the target config (see [layering](#layering-a-key-reaches-a-run-from-three-places) below).
 (real file: [`demos/showcase/scenarios/permission.yaml`](../demos/showcase/scenarios/permission.yaml))
 
+### Notification banners are swiped away, never tapped
+
+A foreground **notification banner** interrupts a step the way a system alert does. The same
+interruption monitor answers a banner. Your `rules` never do
+([BE-0416](../roadmaps/BE-0416-ios-notification-banner-swipe-dismiss/BE-0416-ios-notification-banner-swipe-dismiss.md)).
+
+A banner is not an alert. It offers no button a rule could name. Its one tappable region carries the
+notification's own text. Pressing that region opens the notification's app. A run that
+pressed it would leave the scenario under test.
+
+The runner swipes the banner upward instead, anchored to the banner's own measured frame. The
+runner confirms the banner has gone before claiming the interruption. An unconfirmed swipe hands the
+banner back to XCUITest, whose own handler clears a banner too. Under either path the step's
+interaction lands on the element the scenario named.
+
+A *confirmed* dismissal reaches the run's report on the step it interrupted, under its own kind.
+The text recorded beside that dismissal belongs to the notification, not a button. That kind keeps
+a reader from misreading the text as a button the guard chose.
+
+A swipe the runner could not confirm carries no such record. The runner logs the attempt to its own
+output instead. The report shows nothing beyond the step running slower than usual.
+
+Nothing about a banner is yours to declare. The banner path runs regardless of whether
+`systemAlertHandling` is on. Before BE-0416 a governed run met the banner on the alert path instead.
+No rule matched, so the step failed. Its reason named the notification's body text among the
+buttons the run had expected.
+
 ### Answering more than one prompt differently: `rules`
 
 One onboarding flow often meets several prompts and means a different answer on each. A rule pairs

@@ -366,6 +366,29 @@ def test_undeclared_interruption_fails_a_step_that_otherwise_passed() -> None:
     assert "Don't Allow" in result.steps[0].reason
 
 
+def test_a_notification_banner_lands_on_the_step_it_interrupted_without_failing_it() -> None:
+    # The whole point of BE-0416: a banner the runner swiped away during a step is reported on that
+    # step — so a reader can see what was on screen — while the step itself passes. Before it, the
+    # same banner arrived through the undeclared path and failed this step outright.
+    target: base.Element = {
+        "identifier": "go",
+        "label": "Go",
+        "traits": ["button"],
+        "value": None,
+        "frame": (0.0, 0.0, 10.0, 10.0),
+        "nativeZ": None,
+    }
+    driver = FakeDriver([target])
+    driver.banners_to_drain = ["Ready for Apple Intelligence"]
+
+    result = run_scenario(driver, load_scenarios(_TAP_GO)[0])
+    assert result.ok is True
+    assert result.steps[0].ok is True
+    assert result.steps[0].alerts == [
+        AlertEvent(label="Ready for Apple Intelligence", kind="notificationBanner")
+    ]
+
+
 def test_undeclared_interruptions_are_appended_to_a_step_s_own_failure_and_all_named() -> None:
     # A step that already failed for its own reason keeps that reason: the alert note is appended,
     # not substituted, so a wait's own timeout detail is not lost alongside the alert that caused it.

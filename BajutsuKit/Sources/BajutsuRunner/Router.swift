@@ -64,7 +64,13 @@ final class Router {
             return handleSetInterruptionPolicy(request)
         case ("POST", "/interruptionPolicy/drain"):
             let drained = InterruptionPolicyStore.shared.drain()
-            return .json(200, ["labels": drained.tapped, "unmatched": drained.declined])
+            return .json(
+                200,
+                [
+                    "labels": drained.tapped, "unmatched": drained.declined,
+                    "banners": drained.banners,
+                ]
+            )
         case ("POST", "/systemAlert/query"):
             return handleSystemAlertQuery()
         case ("POST", "/systemAlert/tap"):

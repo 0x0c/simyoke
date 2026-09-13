@@ -1991,6 +1991,59 @@ def test_drain_interruptions_reads_the_labels_the_monitor_tapped_and_declined() 
     assert drained.declined == [["Save", "Not Now"]]
 
 
+def test_drain_interruptions_reads_the_banners_the_monitor_swiped_away() -> None:
+    # A banner comes back in its own field, never folded into `tapped`: nothing was pressed, so the
+    # text below is the notification's own rather than a button's (BE-0416).
+    def transport(method: str, path: str, body: Mapping[str, Any] | None) -> _Reply:
+        return _Reply(
+            status="ok",
+            raw=json.dumps(
+                {"labels": [], "unmatched": [], "banners": ["Ready for Apple Intelligence"]}
+            ).encode(),
+        )
+
+    drained = _driver(transport).drain_interruptions()
+    assert drained.banners == ["Ready for Apple Intelligence"]
+    assert drained.tapped == []
+    assert drained.declined == []
+
+
+def test_drain_interruptions_reads_no_banners_from_a_runner_that_predates_them() -> None:
+    # A pinned older `testRunner` build omits `banners` entirely. It never swiped one away either,
+    # so an absent field and an empty one are the same answer here — unlike the `/tap` fold, where
+    # absence carries its own meaning.
+    def transport(method: str, path: str, body: Mapping[str, Any] | None) -> _Reply:
+        return _Reply(
+            status="ok", raw=json.dumps({"labels": ["Not Now"], "unmatched": []}).encode()
+        )
+
+    drained = _driver(transport).drain_interruptions()
+    assert drained.banners == []
+    assert drained.tapped == ["Not Now"]
+
+
+def test_a_tap_fold_without_banners_is_still_a_fold() -> None:
+    # A runner between BE-0407 Unit 6 and BE-0416 folds `labels`/`unmatched` into every `/tap` but
+    # carries no `banners`. Reading that as "no fold at all" would send the driver back to the wire
+    # for a drain the tap reply already answered.
+    calls: list[str] = []
+
+    def transport(method: str, path: str, body: Mapping[str, Any] | None) -> _Reply:
+        calls.append(path)
+        if path == "/tap":
+            return _Reply(
+                status="ok",
+                raw=json.dumps({"status": "ok", "labels": [], "unmatched": []}).encode(),
+            )
+        return _Reply(status="ok", raw=json.dumps({"labels": [], "unmatched": []}).encode())
+
+    driver = _driver(transport)
+    driver.tap_point((10.0, 20.0))
+    drained = driver.drain_interruptions()
+    assert calls == ["/tap"], "the tap's own fold answered; the wire must not be asked again"
+    assert drained.banners == []
+
+
 def test_drain_interruptions_is_empty_when_the_runner_answered_nothing() -> None:
     # The common case by far — nothing interrupted this step — so it must cost the caller no special
     # handling and never fabricate an event.
@@ -2069,6 +2122,56 @@ def test_drain_interruptions_merges_the_carried_fold_with_the_wire_after_somethi
     driver.query()  # something else happened — the carry alone can no longer be trusted complete
     drained = driver.drain_interruptions()  # must hit the wire AND keep the earlier tap's carry
     assert drained.tapped == ["Not Now", "Allow"]
+
+
+def test_drain_interruptions_merges_banners_across_the_same_two_sources() -> None:
+    # The `tapped`/`declined` merge above has its own test; `banners` concatenates through the exact
+    # same two call sites (the fold accumulator and the carry-plus-wire merge), so a typo that turned
+    # either concatenation into an overwrite would silently drop a banner swiped during an earlier
+    # tap the moment a query intervened before the next drain — and neither existing banner test
+    # would catch it, since each seeds only one source at a time.
+    def transport(method: str, path: str, body: Mapping[str, Any] | None) -> _Reply:
+        if path == "/elements":
+            return _elements(_el_wire("h-ok", "ok", "OK"))
+        if path == "/tap":
+            return _Reply(
+                status="ok",
+                raw=json.dumps({"labels": [], "unmatched": [], "banners": ["first"]}).encode(),
+            )
+        assert path == "/interruptionPolicy/drain"
+        return _Reply(
+            status="ok",
+            raw=json.dumps({"labels": [], "unmatched": [], "banners": ["second"]}).encode(),
+        )
+
+    driver = _driver(transport)
+    driver.tap({"id": "ok"})
+    driver.query()  # something else happened — the carry alone can no longer be trusted complete
+    drained = driver.drain_interruptions()  # must hit the wire AND keep the earlier tap's carry
+    assert drained.banners == ["first", "second"]
+
+
+def test_two_taps_own_folds_accumulate_banners_before_any_drain() -> None:
+    # `_tracking_transport` folds each `/tap` reply's own drain into the carry as it accumulates
+    # (`carry.drained.banners + fold.banners`) — a second tap's banner must join the first's rather
+    # than replace it, the same as `tapped`/`declined` already do.
+    replies = iter(
+        [
+            json.dumps({"labels": [], "unmatched": [], "banners": ["first"]}).encode(),
+            json.dumps({"labels": [], "unmatched": [], "banners": ["second"]}).encode(),
+        ]
+    )
+
+    def transport(method: str, path: str, body: Mapping[str, Any] | None) -> _Reply:
+        if path == "/elements":
+            return _elements(_el_wire("h-ok", "ok", "OK"))
+        assert path == "/tap"
+        return _Reply(status="ok", raw=next(replies))
+
+    driver = _driver(transport)
+    driver.tap({"id": "ok"})
+    driver.tap({"id": "ok"})  # no drain, no query in between — the carry alone must hold both
+    assert driver.drain_interruptions().banners == ["first", "second"]
 
 
 def test_drain_interruptions_keeps_the_carry_when_the_wire_drain_fails() -> None:

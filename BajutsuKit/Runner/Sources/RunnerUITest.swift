@@ -46,6 +46,13 @@ final class RunnerUITest: XCTestCase {
         // can fail by name instead of continuing as if nothing had answered on the scenario's
         // behalf.
         _ = addUIInterruptionMonitor(withDescription: "bajutsu: the scenario's policy answers system alerts") { alert in
+            // Answered before the policy is consulted at all — in particular before the `governs`
+            // guard, since neither branch below is right for a banner (see `isNotificationBanner`,
+            // BE-0416): a governed run would record it as an undeclared interruption and fail a
+            // passing step, an ungoverned one would leave XCUITest to wait it out.
+            if isNotificationBanner(identifier: alert.identifier) {
+                return Self.swipeAwayNotificationBanner(alert)
+            }
             let policy = InterruptionPolicyStore.shared.policy
             guard policy.governs else { return false }
             let buttons = alert.buttons
@@ -73,6 +80,95 @@ final class RunnerUITest: XCTestCase {
             return true
         }
     }
+
+    /// Clear an interrupting notification banner with an upward swipe, and report whether it went.
+    ///
+    /// A swipe, not a tap: the banner's one button opens the notification's own app, which would
+    /// navigate the run away from the scenario under test. The gesture is anchored to the banner's
+    /// measured frame rather than a fixed screen coordinate, so it holds across device sizes, and it
+    /// ends just above that frame rather than past the screen's edge, where the drag would become
+    /// SpringBoard's own top-edge gesture instead.
+    ///
+    /// Returning `true` claims the interruption, and XCUITest re-invokes a monitor that claimed one
+    /// it did not actually clear — the same unbounded reinvocation loop BE-0399 measured for an
+    /// alert (above), reproduced for a banner while measuring BE-0416 by capping a throwaway test
+    /// monitor at six invocations rather than letting it run to the failure BE-0399 hit. So the
+    /// clearance is *confirmed* before claiming it, and an unconfirmed swipe declines instead,
+    /// handing the banner back to XCUITest's own handler, which does clear it.
+    ///
+    /// A decline here still needs to be *legible*, or it reproduces in miniature the invisibility
+    /// this whole mechanism exists to end: nothing calls `recordDeclined` for a banner (that path
+    /// classifies as an `UndeclaredInterruption` and would fail the step, the outcome BE-0416 removes
+    /// for a banner), so an unconfirmed swipe is logged instead — observable without being fatal.
+    private static func swipeAwayNotificationBanner(_ banner: XCUIElement) -> Bool {
+        let frame = banner.frame
+        guard frame.height > 0 else {
+            logUnconfirmedBanner("the interrupting element reported an empty frame")
+            return false
+        }
+        // Read before the swipe: once the banner is gone its label resolves to empty, and the label
+        // is the only thing that identifies the dismissal in the run's report.
+        let label = banner.label
+        let springboard = XCUIApplication(bundleIdentifier: springboardBundleID)
+        let origin = springboard.coordinate(withNormalizedOffset: .zero)
+        let from = origin.withOffset(CGVector(dx: frame.midX, dy: frame.midY))
+        let to = origin.withOffset(
+            CGVector(dx: frame.midX, dy: max(bannerSwipeTopMargin, frame.minY - bannerSwipeTravel))
+        )
+        // Re-checked immediately before the gesture, mirroring the alert branch's own `button.exists`
+        // guard above: the banner can lose the race with its own auto-dismissal between the frame
+        // read and this press, and a flick delivered at its former screen position would then land on
+        // whatever the application under test draws there instead — a gesture the scenario never
+        // asked for.
+        guard banner.exists else {
+            logUnconfirmedBanner("the banner disappeared before the swipe could be sent")
+            return false
+        }
+        from.press(forDuration: bannerSwipePressDuration, thenDragTo: to)
+
+        let remaining = springboard.descendants(matching: .any)
+            .matching(identifier: notificationBannerIdentifier)
+        let deadline = Date().addingTimeInterval(bannerClearanceTimeout)
+        repeat {
+            if !remaining.firstMatch.exists {
+                InterruptionPolicyStore.shared.recordBanner(label)
+                return true
+            }
+        } while Date() < deadline
+        logUnconfirmedBanner("the banner was still on screen \(bannerClearanceTimeout)s after the swipe")
+        return false
+    }
+
+    private static func logUnconfirmedBanner(_ reason: String) {
+        FileHandle.standardError.write(
+            Data("bajutsu runner: notification banner swipe unconfirmed (\(reason)) — declining to XCUITest's own handler\n".utf8)
+        )
+    }
+
+    /// How far above the banner's own top edge the swipe ends. Measured sufficient on iOS 26.5;
+    /// the gesture only has to carry the banner into its dismissal, not off the screen.
+    private static let bannerSwipeTravel: CGFloat = 20
+
+    /// The highest point the swipe may end at. SpringBoard claims a drag that starts or ends within
+    /// a few points of the top edge as its own notification-shade gesture, which would pull the
+    /// shade down instead of dismissing the banner.
+    private static let bannerSwipeTopMargin: CGFloat = 8
+
+    /// How long the gesture presses before it starts travelling — half the `swipe` path's own 0.1s,
+    /// so the drag reads as a dismissal rather than a long press. It is not what makes the gesture a
+    /// flick: `press(forDuration:thenDragTo:)` takes no velocity, so the traversal runs at XCUITest's
+    /// `.default` speed either way. The knob that would change that is `withVelocity:`, which `scroll`
+    /// passes precisely because it is "the whole of what makes the gesture non-inertial"
+    /// (`XcuitestElementProvider.scrollVelocity`, BE-0400).
+    private static let bannerSwipePressDuration: TimeInterval = 0.05
+
+    /// How long the swipe's clearance is re-checked before it counts as unconfirmed. A deadline, not
+    /// a sample count: a fixed count of SpringBoard queries scales with host speed, so it can decide
+    /// "unconfirmed" for a swipe that actually landed on a slow host, or block a fast one for far
+    /// longer than the ~32ms per query measured while sizing this. A deadline instead gives the
+    /// dismissal animation the same real time on every host, while each poll is still a real
+    /// SpringBoard query rather than a sleep (determinism first).
+    private static let bannerClearanceTimeout: TimeInterval = 2
 
     override func record(_ issue: XCTIssue) {
         super.record(issue)

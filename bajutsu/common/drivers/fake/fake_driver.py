@@ -49,6 +49,9 @@ class FakeDriver:
         self.interruption_policy: tuple[list[tuple[set[str], str]], bool] | None = None
         self.interruptions_to_drain: list[str] = []
         self.interruptions_declined_to_drain: list[list[str]] = []
+        # Notification banners the runner-side monitor should report having swiped away (BE-0416),
+        # seeded the same way and just as inert.
+        self.banners_to_drain: list[str] = []
         # The rows each seeded picker wheel offers `set_picker_value` (BE-0356), keyed by `id()` of
         # the `Element` object in `screen` rather than by its identifier: a multi-component picker's
         # sibling wheels (a year wheel beside a month wheel) carry no identifier of their own — they
@@ -250,13 +253,14 @@ class FakeDriver:
         self.interruption_policy = ([(set(identify), tap) for identify, tap in rules], governs)
 
     def drain_interruptions(self) -> base.DrainedInterruptions:
-        """Hand back (and clear) whatever `interruptions_to_drain`/`_declined_to_drain` was seeded with."""
+        """Hand back (and clear) whatever the three `*_to_drain` lists were seeded with."""
         tapped, self.interruptions_to_drain = list(self.interruptions_to_drain), []
         declined, self.interruptions_declined_to_drain = (
             list(self.interruptions_declined_to_drain),
             [],
         )
-        return base.DrainedInterruptions(tapped=tapped, declined=declined)
+        banners, self.banners_to_drain = list(self.banners_to_drain), []
+        return base.DrainedInterruptions(tapped=tapped, declined=declined, banners=banners)
 
     def dismiss_blocking_tip(self, tree: list[base.Element] | None = None) -> bool:
         # Mirrors the real driver: a tip is the region *and* the container together, absence is

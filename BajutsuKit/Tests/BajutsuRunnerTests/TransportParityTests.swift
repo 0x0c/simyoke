@@ -183,7 +183,7 @@ final class TransportParityTests: XCTestCase {
                 "/tap (\(result))",
                 // `/tap`'s interruption-drain fold (BE-0407 Unit 6) is a deliberate difference from
                 // the legacy `Router`, which never gains it — pinned separately in `TapDrainFoldTests`.
-                ignoringKeys: ["labels", "unmatched"]
+                ignoringKeys: ["labels", "unmatched", "banners"]
             )
             try assertSame(
                 try wire("POST", "/isHittable", json: ["handle": handle.live]),
@@ -218,7 +218,7 @@ final class TransportParityTests: XCTestCase {
             try wire("POST", "/tap", json: ["point": [12.5, 34]]),
             try reference("POST", "/tap", json: ["point": [12.5, 34]]),
             "/tap (coordinate)",
-            ignoringKeys: ["labels", "unmatched"]
+            ignoringKeys: ["labels", "unmatched", "banners"]
         )
         XCTAssertEqual(provider.tapPointCalls.count, 1, "the coordinate path must reach the provider")
         try assertSame(
@@ -335,6 +335,25 @@ final class TransportParityTests: XCTestCase {
             JSONSerialization.jsonObject(with: second.body) as? [String: Any]
         )
         XCTAssertEqual(secondJSON["unmatched"] as? [[String]], [])
+    }
+
+    func testInterruptionPolicyDrainReportsBannersApartFromTappedLabels() throws {
+        // A swiped banner is a dismissal, but not one any rule chose, so it comes back through its
+        // own field rather than joining `labels` — where it would reach the report as a button that
+        // was never pressed (BE-0416). It is reported whether or not the policy governs: a banner
+        // offers nothing for a rule to identify, so nothing about it is the scenario's to declare.
+        InterruptionPolicyStore.shared.setPolicy(InterruptionPolicy(governs: false))
+        InterruptionPolicyStore.shared.recordBanner("Ready for Apple Intelligence")
+        let reply = try wire("POST", "/interruptionPolicy/drain", json: [:])
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: reply.body) as? [String: Any])
+        XCTAssertEqual(json["banners"] as? [String], ["Ready for Apple Intelligence"])
+        XCTAssertEqual(json["labels"] as? [String], [])
+        XCTAssertEqual(json["unmatched"] as? [[String]], [])
+        let second = try wire("POST", "/interruptionPolicy/drain", json: [:])
+        let secondJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: second.body) as? [String: Any]
+        )
+        XCTAssertEqual(secondJSON["banners"] as? [String], [])
     }
 
     func testScreenshotServesRawPNGOverTheWire() throws {

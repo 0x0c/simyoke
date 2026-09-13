@@ -174,19 +174,27 @@ def push_interruption_policy(driver: base.Driver, guard: AlertGuardConfig | None
 
 
 def drain_interruptions(driver: base.Driver) -> DrainedInterruptionEvents:
-    """The prompts the backend answered and declined at interruption time since the last drain.
+    """The prompts the backend answered, declined and swiped away at interruption time since the last drain.
 
     A tapped label is reported as an ordinary `AlertEvent` so a dismissal that happened inside the
     backend's own interruption handling is not missing from the run's report. A declined alert is
     reported as an `UndeclaredInterruption` instead — nothing answered it on the scenario's behalf,
     so it is not a dismissal, but its buttons are what lets a caller fail by name rather than let the
     interruption pass in silence (BE-0406 Unit 2b). A backend without the opt-in contributes nothing.
+
+    A swiped-away notification banner is a dismissal like the first, so it joins `alerts` rather than
+    `undeclared` — under its own kind, since nothing was tapped and the label is the notification's
+    text (BE-0416). It is deliberately *not* an undeclared interruption: no scenario could have
+    declared it, because a banner offers no button for a rule to identify, so failing the step over
+    one would fail every run a notification happened to land in.
     """
     if not isinstance(driver, base.InterruptionPolicyTarget):
         return DrainedInterruptionEvents(alerts=[], undeclared=[])
     drained = driver.drain_interruptions()
+    tapped = [AlertEvent(label=label) for label in drained.tapped]
+    swiped = [AlertEvent(label=text, kind="notificationBanner") for text in drained.banners]
     return DrainedInterruptionEvents(
-        alerts=[AlertEvent(label=label) for label in drained.tapped],
+        alerts=tapped + swiped,
         undeclared=[UndeclaredInterruption(buttons=buttons) for buttons in drained.declined],
     )
 

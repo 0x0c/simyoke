@@ -288,9 +288,16 @@ def wait_for_system_alert(
                     # A tapped label that is not `sel`'s own is some other declared rule's alert,
                     # resolved by the monitor while this step happened to be polling — draining it
                     # here consumes it from the store, so it must be recorded now or the report
-                    # loses it entirely (the end-of-step drain will find nothing left to read).
+                    # loses it entirely (the end-of-step drain will find nothing left to read). A
+                    # notification banner swiped away during the same poll is drained here too, for
+                    # the identical reason: it can never be `sel`'s own alert (BE-0416), so it always
+                    # belongs in `unrelated`'s company rather than the matched-alert branch below.
                     unrelated = [label for label in drained.tapped if label not in matched]
                     alerts.extend(AlertEvent(label=label) for label in unrelated)
+                    alerts.extend(
+                        AlertEvent(label=text, kind="notificationBanner")
+                        for text in drained.banners
+                    )
                 if matched:
                     if alerts is not None:
                         alerts.append(AlertEvent(label=matched[0]))

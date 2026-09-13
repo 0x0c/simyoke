@@ -77,14 +77,18 @@ final class APIHandler: APIProtocol {
         return .ok(.init(body: .json(.init(status: .ok))))
     }
 
-    /// Hands back what the monitor tapped and declined since the last drain, so the driver can
-    /// report them — a tapped label as an `AlertEvent`, a declined button list as an
-    /// `UndeclaredInterruption` (BE-0406 Unit 2b).
+    /// Hands back what the monitor tapped, declined and swiped away since the last drain, so the
+    /// driver can report them — a tapped label as an `AlertEvent`, a declined button list as an
+    /// `UndeclaredInterruption` (BE-0406 Unit 2b), a swiped banner as an `AlertEvent` of its own
+    /// kind (BE-0416).
     func drainInterruptions(
         _ input: Operations.drainInterruptions.Input
     ) async throws -> Operations.drainInterruptions.Output {
         let drained = InterruptionPolicyStore.shared.drain()
-        return .ok(.init(body: .json(.init(labels: drained.tapped, unmatched: drained.declined))))
+        let reply = Components.Schemas.InterruptionsReply(
+            labels: drained.tapped, unmatched: drained.declined, banners: drained.banners
+        )
+        return .ok(.init(body: .json(reply)))
     }
 
     // MARK: - Reads
@@ -318,11 +322,14 @@ final class APIHandler: APIProtocol {
     /// tap's own outcome, matching the standalone endpoint: an interruption can land mid-actuation
     /// regardless of whether the tap itself lands.
     ///
-    /// Always attaches both fields, empty arrays included, even though the reply schema marks them
-    /// optional: their *presence* is itself the driver's signal that this runner folds a drain into
-    /// `/tap` at all (BE-0407 Unit 6), so a present-but-empty pair must read differently from an
-    /// absent one — a runner predating this fold. `APIHandlerParityTests` accounts for the resulting,
-    /// deliberate difference from the legacy `Router`, which never gains these fields at all.
+    /// Always attaches `labels` and `unmatched`, empty arrays included, even though the reply schema
+    /// marks them optional: their *presence* is itself the driver's signal that this runner folds a
+    /// drain into `/tap` at all (BE-0407 Unit 6), so a present-but-empty pair must read differently
+    /// from an absent one — a runner predating this fold. `banners` rides along on the same reply
+    /// (BE-0416) but carries no such signal of its own: the driver's presence test still keys on the
+    /// original two fields alone, since a runner between Unit 6 and BE-0416 folds those and omits
+    /// `banners`. `APIHandlerParityTests` accounts for the resulting, deliberate difference from the
+    /// legacy `Router`, which never gains these fields at all.
     private func withDrain(
         _ reply: Components.Schemas.ActuationReply
     ) -> Components.Schemas.ActuationReply {
@@ -330,6 +337,7 @@ final class APIHandler: APIProtocol {
         var reply = reply
         reply.labels = drained.tapped
         reply.unmatched = drained.declined
+        reply.banners = drained.banners
         return reply
     }
 

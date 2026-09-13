@@ -7,8 +7,9 @@
 |---|---|
 | Proposal | [BE-0416](BE-0416-ios-notification-banner-swipe-dismiss.md) |
 | Author | [@0x0c](https://github.com/0x0c) |
-| Status | **Proposal** |
+| Status | **In progress** |
 | Tracking issue | [Search](https://github.com/bajutsu-e2e/bajutsu/issues?q=is%3Aissue+label%3Aroadmap-tracking+in%3Atitle+"BE-0416") |
+| Implementing PR | [#1975](https://github.com/bajutsu-e2e/bajutsu/pull/1975) (units 1, 4, 6, 7) |
 | Topic | Platform support |
 | Related | [BE-0177](../BE-0177-run-behavior-target-config/BE-0177-run-behavior-target-config.md), [BE-0314](../BE-0314-scenario-interrupt-handlers/BE-0314-scenario-interrupt-handlers.md), [BE-0315](../BE-0315-ios-native-system-alert-handling/BE-0315-ios-native-system-alert-handling.md), [BE-0399](../BE-0399-ios-system-alert-interruption-policy/BE-0399-ios-system-alert-interruption-policy.md), [BE-0406](../BE-0406-system-alert-declared-prompts/BE-0406-system-alert-declared-prompts.md) |
 <!-- /BE-METADATA -->
@@ -56,103 +57,119 @@ guard clears the banner before the tap executes, and the tap lands on the target
 
 ## Detailed design
 
-### Unit 1 — measure the banner's accessibility surface on a device
+### Unit 1 — the banner's accessibility surface, measured
 
-Before any driver method is added, measure how a foreground notification banner actually appears to
-XCUITest, on a booted Simulator, across the iOS versions the existing system-alert work already covers
-(18.6, 26.3, 26.4, 26.5). This measurement answers six questions. Five of them decide the shape of
-every later unit:
+Measured on dedicated Simulators against a throwaway host app that raises its own foreground banner:
+iPhone 17 Pro on iOS 26.5, and iPhone 16 Pro on iOS 18.6. iOS 26.3 and 26.4 sit between the two
+confirmed versions and were not measured separately. The two endpoints agreed on every answer below,
+identifier and subtree included.
 
-1. Which process's element tree exposes the banner — SpringBoard, as with a system alert, or a distinct
-   process.
-2. What frame or identifier the banner offers, if any.
-3. What the presence query enumerates when a scenario raises two banners at once — separately
-   measurable frames a guard can order, or frames that coincide with no ordering signal between them.
-4. Whether an ordinary `tap`/`type` step already receives XCUITest's own interruption-monitor treatment
-   when its target sits under the banner's frame, the treatment BE-0399 measured for a system alert, or
-   whether hit-testing instead resolves the overlap silently, with no interruption dispatched at all.
-5. Only if the monitor is invoked, whether a swipe issued from inside its handler can be confirmed to
-   have cleared the banner before the handler returns `true` — XCUITest checks the interruption only
-   after the handler returns, and re-invokes the monitor when it finds the banner still up.
+| Question | Measured answer |
+|---|---|
+| Which process exposes the banner | `com.apple.springboard`, the same process a system alert comes from. The application's own tree shows nothing at all. |
+| What frame or identifier the banner offers | A SpringBoard element carrying `identifier: NotificationShortLookView`, whose label is the notification's full text. Measured frame `{{8, 58.7}, {386, 78.7}}` on iOS 26.5. Its subtree holds `ShortLook.Platter` and, sharing the same frame, one hittable `Button` — `ShortLook.Platter.Content.Seamless` — whose label is that same text. |
+| What a second concurrent banner enumerates | Nothing new: iOS coalesces concurrent banners, so the query finds exactly one `NotificationShortLookView` and one frame. Unit 2's "topmost by frame" ordering has no case to resolve. |
+| Whether a banner reaches XCUITest's interruption monitor | Yes, on an *interaction*. A plain query never invokes the monitor and never clears the banner, however many times it runs. |
+| Whether a handler can swipe and confirm before returning `true` | Yes. A handler that swiped by the element's own frame, confirmed the banner gone, and returned `true` was invoked exactly once; the interrupted tap then landed on its intended target, with the application still in the foreground. |
+| Whether declining reproduces BE-0399's reinvocation loop | No. A declining monitor hands the banner to XCUITest's own handler, which clears it, and the monitor is not invoked again. A monitor that returns `true` *without* clearing does loop — reproduced by capping a throwaway test monitor at six invocations rather than letting it run to the unbounded failure BE-0399 measured. |
 
-The sixth question is independent of this proposal, detailed next.
+Two further measurements, outside the six questions, reshape the design below.
 
-BE-0399's monitor is already installed on every run with `systemAlertHandling` on. Its decline of an
-interruption it cannot match hands the alert to XCUITest's own default handler, which clears it by
-pressing the alert's default button — but a banner has no button for that handler to press. So, if the
-fourth fact confirms a banner reaches the monitor, the sixth question is whether that already
-reproduces BE-0399's own measured reinvocation loop today, with no code from this proposal involved. A
-monitor that claims an interruption it cannot confirm cleared gets re-invoked on every following
-interaction, and that looped until the runner died in every attempt BE-0399 measured. A confirmed loop
-there is an existing defect this item did not create, and it should be reported on its own regardless
-of whether this item
-proceeds. This unit produces no code; the measurement fixes the design questions Unit 4 currently
-leaves open.
+**What today costs is latency, not a misdirected tap.** An undisturbed tap took 0.58s. The same tap
+under a banner took **9.18s**, with no monitor and with BE-0399's declining monitor alike: XCUITest
+waits the banner out rather than pressing anything. A handler that swipes brought that to **3.72s**.
+The banner never received the tap in any arrangement measured, and XCUITest's own handler never
+pressed the banner's button either — the application's `didReceive` delegate never fired — so the
+"tapping the banner opens its app" hazard the Motivation names is a hazard of *this item's own
+implementation*, not a description of today's behavior.
+
+The same measurement retires the two claims beside that one. A step does not "tap the banner instead
+of the target". Nor does it "resolve against whichever element XCUITest's own hit-testing picks".
+Both are what the proposal assumed before Unit 1 ran. The interrupted tap landed on its intended
+target in every arrangement above. With both claims retired, the item's own falsification criterion
+goes too. It watches for that same landing, so it reads the same before and after and distinguishes
+nothing. What separates before and after sits elsewhere. Unit 1's measurement established two
+justifications instead. One is the spurious step defect measured next. The other is the corrupted
+`after.png` and visual-regression capture Unit 8 exists to reach.
+
+**A banner already fails a passing step whenever `systemAlertHandling` is on.** BE-0399's monitor
+asks the interrupting element for `alert.buttons`. A banner answers with exactly one button whose
+label is the notification's own text, so no rule can ever identify it, `recordDeclined` fires, and
+BE-0406 Unit 2b turns that into a step failure that overrides an `expect` that passed. Measured
+directly: `wouldRecordDeclined=true`, with the notification's body text standing in for the buttons
+the run had expected. Nothing in this item created that defect, and shipping Unit 4 is what removes
+it.
+
+A persistent banner — the style iOS uses for the "Ready for Apple Intelligence" notification, and
+the case that prompted this item — was measured separately by setting `alertType` to `2` in the
+Simulator's own `VersionedSectionInfo.plist`. Such a banner stays up indefinitely, confirmed past
+30s. XCUITest nonetheless cleared it and landed the tap, in 3.53s. The latency gap therefore closes
+on a persistent banner while the spurious failure remains, which is what makes the failure, rather
+than the latency, this item's primary justification.
 
 ### Unit 2 — a deterministic presence query
 
-Add a driver method that reports whether a notification banner is currently showing and, when one is,
-the on-screen frame the swipe in Unit 3 needs. This mirrors the shape of BE-0315's
-`system_alert_labels()`: a thin, non-blocking read that reports a fact and decides nothing. The method
-sits behind its own capability token, the way `HANDLE_SYSTEM_ALERT` gates BE-0315's query: only the iOS
-XCUITest backend advertises it at first, and a backend without it reports absence rather than an error.
-When more than one banner is on screen at once, the query's behavior follows Unit 1's third fact.
-Concurrent iOS banners typically stack at the same on-screen position, so a shared frame already names
-the correct swipe target regardless of which specific banner element the query happened to enumerate —
-the guard swipes it, re-polls, and repeats for whatever remains, the same one-per-poll flow Units 3 and
-4 already describe. If Unit 1 instead finds concurrent banners at genuinely different, non-overlapping
-frames, the query reports the topmost by that frame — a stated, deterministic order (prime directive 2)
-rather than whichever banner XCUITest happens to report first — so the guard can dismiss it and re-poll
-for the next, rather than aborting a run over an interruption it can clear.
+Add a driver method that reports whether a notification banner is currently showing and, when one
+is, the on-screen frame Unit 3's swipe needs. This mirrors the shape of BE-0315's
+`system_alert_labels()`: a thin, non-blocking read that reports a fact and decides nothing. The
+method sits behind its own capability token, the way `HANDLE_SYSTEM_ALERT` gates BE-0315's query:
+only the iOS XCUITest backend advertises it at first, and a backend without it reports absence
+rather than an error. Unit 1 settled the query's shape — it matches `NotificationShortLookView`
+against SpringBoard's whole tree and reports at most one banner, since iOS coalesces concurrent ones
+— and measured its cost at ~32ms when no banner is up, against ~15ms for the existing
+`springboard.alerts.firstMatch.exists` probe beside it.
+
+Unit 1 also narrowed what this query is *for*. It cannot serve the interruption path Unit 4 takes,
+because that path already holds the banner element. What it serves is Unit 8's proactive poll, which
+is the one thing the interruption path cannot do: clear a banner that is merely sitting on screen
+while nothing interacts with it.
 
 ### Unit 3 — a deterministic swipe-dismiss action
 
 Add a driver action that swipes the banner away, anchored to the frame Unit 2 reports rather than a
-fixed screen coordinate, so the gesture holds across device sizes. The direction matches how a person
-dismisses a real banner: upward, toward the top of the screen, ending at an on-screen point above the
-banner's own frame rather than past the screen's edge. The action reuses the coordinate machinery
-`swipe`'s existing driver implementation already has, rather than adding a second gesture primitive;
-because that machinery resolves a point as an offset from the application's own origin, this unit also
-states how the frame Unit 2 reports — measured in the banner-owning process's coordinate space —
-converts into it. Because Unit 2 always reports at most one banner — the topmost, when several are stacked — the action
-always dismisses the single frame it receives; a guard that finds more than one banner clears them one
-poll at a time rather than in a single action.
+fixed screen coordinate, so the gesture holds across device sizes. The direction matches how a
+person dismisses a real banner: upward, ending at an on-screen point above the banner's own frame
+rather than past the screen's edge, where SpringBoard claims the drag as its own notification-shade
+gesture instead. The action reuses the coordinate machinery `swipe`'s existing driver implementation
+already has, rather than adding a second gesture primitive; because that machinery resolves a point
+as an offset from the application's own origin, this unit also states how the frame Unit 2 reports —
+measured in SpringBoard's coordinate space — converts into it.
 
-### Unit 4 — reactive wiring
+Like Unit 2, this unit now serves Unit 8's proactive poll alone. Unit 4's monitor path performs the
+same gesture inside the runner, against the element XCUITest handed it, without a driver round trip.
 
-A config- and scenario-level toggle arms a guard that polls Unit 2's presence query on the bounded
-interval BE-0315 already established for the SpringBoard probe, and dismisses the banner through
-Unit 3's action the moment one is found. Unit 1's fifth measurement decides which of two paths the
-guard takes, and the choice is not symmetric: only one of them is safe to take unconditionally. When
-Unit 1 confirms that the handler can swipe the banner away and see it gone before it returns `true`,
-the guard answers through that monitor, mirroring how BE-0399's
-monitor answers an interrupting alert. That monitor path is available only when `systemAlertHandling`
-is also on: it is the single global monitor BE-0399 installed, gated by `policy.governs`, which only
-`systemAlertHandling` sets. With `systemAlertHandling` off, the banner toggle never reaches that
-monitor and always takes the fallback below, regardless of what Unit 1 found. In every other case —
-including when Unit 1 cannot confirm that guarantee — the guard instead polls and clears the banner
-immediately before each act step's own actuation. It then re-issues the presence query once more after
-its own swipe and waits for it to report the banner gone before letting the step's tap fire. A swipe is
-not instantaneous, and a tap synthesized the moment the drag lifts can still land on a banner whose
-dismissal animation is still running. That
-pre-actuation check issues its own presence query at the step boundary rather than reusing the
-interval-bounded poll's last answer, since acting on a remembered probe result is the defect BE-0399
-measured. That fallback carries a known, accepted limitation: a banner arriving in the gap between the
-poll and the tap's own synthesis can still intercept the tap, so this item does not claim the tap always
-lands, only that it lands far more reliably than today. Closing that residual gap is left to a
-follow-up rather than blocking this item. Either branch records the dismissal on the step it
-interrupted, folded into that step's `AlertEvent`s the same way BE-0399's drained labels are. Because
-the banner carries no button, that record needs a field of its own to be legible: `AlertEvent` carries
-only `label` — the button the guard tapped, empty when none was named — and the report serializes only
-that field, so a banner dismissal would arrive as an empty label, the shape an alert with no named
-button already has. This unit adds an optional discriminator to `AlertEvent`, defaulting to today's
-alert case so no existing report changes, and a banner dismissal is identifiable in the run's report
-rather than merely present. The guard is armed only on a
-backend that advertises the capability Unit 2 and Unit 3 gate their driver calls behind; on a backend
-without it, the toggle has no effect and today's behavior is unchanged. The toggle follows the same
-config-then-scenario, flag-overridable precedence
-([BE-0177](../BE-0177-run-behavior-target-config/BE-0177-run-behavior-target-config.md)) that
-`systemAlertHandling` and its `--system-alert-handling` CLI flag already established.
+### Unit 4 — the interruption-monitor path
+
+Unit 1's fourth and fifth measurements selected this path, and Unit 1's second extra finding made it
+the unit that carries the item's value: a banner reaching BE-0399's alert path fails a step that
+would otherwise pass.
+
+The runner's existing interruption monitor gains a branch for a notification banner, taken *ahead of
+the policy* rather than inside it. Recognition is by identifier: Unit 1 measured
+`NotificationShortLookView` stable across iOS 18.6 and 26.5, while the element's type is an
+undocumented raw value and its one button's label varies per notification and per locale. The branch
+sits ahead of the `governs` check because neither alert outcome fits a banner — a governing policy
+records it as an undeclared interruption and fails the step, and an ungoverned one leaves XCUITest
+to wait the banner out.
+
+On that branch the monitor swipes the banner upward by its own frame, then confirms the clearance
+before claiming the interruption. Confirmation is what keeps the claim honest: Unit 1 reproduced the
+reinvocation loop BE-0399 warned about, so a monitor that claimed a banner it had not cleared would
+take the resident runner down. An unconfirmed swipe declines instead, handing the banner back to
+XCUITest's own handler, which Unit 1 measured does clear it.
+
+The dismissal reaches the report through the existing drain, as an `AlertEvent` — a dismissal, not
+an `UndeclaredInterruption`, since nothing a scenario could declare would identify a banner. Because
+the banner carries no button, that record needs a field of its own to be legible: `AlertEvent`
+carries only `label`, so a banner dismissal would otherwise arrive as an alert whose locator named
+no button. This unit adds an optional discriminator to `AlertEvent`, defaulting to today's alert
+case, and renders it in the run's report.
+
+**No config or scenario toggle.** The proposal called for one, on the shape BE-0177 established for
+`systemAlertHandling`. Unit 1 removed the case for it. A scenario cannot observe a banner — `expect`
+runs against the application's own tree, which Unit 1 confirmed never shows one — so no scenario can
+be broken by clearing it, and a toggle would carry no known use. Should one appear, Unit 8 is where
+it belongs, since the proactive poll is the half that spends time on every step.
 
 ### Unit 5 — showcase fixture and on-device verification
 
@@ -170,33 +187,61 @@ showcase apps present no foreground banner today —
 `UNUserNotificationCenterDelegate` foreground presentation the banner needs, and answers the
 notification-authorization prompt in the fixture with a `handleSystemAlert` step, since `permissions`
 cannot pre-grant notification authorization on iOS ([`docs/scenarios.md`](../../docs/scenarios.md)).
-The tap under test must sit inside the frame Unit 1 measured for the banner, so the overlap holds by
-construction; if no showcase control does, this unit adds one. The off-Simulator gate cannot prove a
-native swipe against a real banner; the unit that lands the
-driver methods must exercise this scenario on a booted Simulator.
+The tap under test must sit inside the frame Unit 1 measured — `{{8, 58.7}, {386, 78.7}}` on a
+6.3-inch device — so the overlap holds by construction; if no showcase control does, this unit adds
+one. The off-Simulator gate cannot prove a native swipe against a real banner, so this unit must
+exercise the scenario on a booted Simulator.
 
 ### Unit 6 — docs
 
-Document the new toggle in [`docs/scenarios.md`](../../docs/scenarios.md), its CLI flag in
-[`docs/cli.md`](../../docs/cli.md), and both `docs/ja/` mirrors, alongside `interrupts` and
-`systemAlertHandling`, extending BE-0314's existing comparison of when to reach for each mechanism.
+Document the banner branch in [`docs/scenarios.md`](../../docs/scenarios.md) alongside `interrupts`
+and `systemAlertHandling`, extending BE-0314's existing comparison of when to reach for each
+mechanism, and mirror it in [`docs/ja/scenarios.md`](../../docs/ja/scenarios.md). Record the branch
+and its placement ahead of the `governs` check in
+[`docs/architecture.md`](../../docs/architecture.md) and its Japanese mirror, as BE-0113 requires of
+a change to behavior those pages describe. There is no CLI flag to document, since Unit 4 adds no
+toggle.
 
 ### Unit 7 — tests
 
-Schema parse/validate for the new toggle; a fake driver whose presence query flips between polls; the
-guard dismissing the banner before a step's own actuation; the dismissal reaching the step's
-`AlertEvent`s and carrying the discriminator that tells it apart from an alert dismissal; the
-capability gate leaving a backend without it unchanged; the config-then-scenario
-precedence layering; and, if Unit 1 finds the interruption-monitor path is needed, coverage for that
-path the way BE-0399's own test suite covers the alert monitor.
+For Unit 4: recognition of SpringBoard's banner identifier, and its rejection of an alert's; that a
+banner's own button can never identify a rule, the condition that used to fail a passing step; the
+store reporting a swiped banner apart from a tapped label, clearing it once drained, ordering
+oldest-first, and dropping what a previous scenario queued; the drain endpoint carrying the banners
+over both the generated and the legacy transport; the driver reading them, and reading none from a
+runner that predates them; a `/tap` fold without them still counting as a fold; the orchestrator
+mapping them to `AlertEvent`s of their own kind and never to an `UndeclaredInterruption`; a banner
+landing on the step it interrupted without failing it; and the report telling the two kinds apart in
+both the manifest round trip and the rendered HTML.
+
+For Units 2, 3, and 8 when they land: a fake driver whose presence query flips between polls, the
+guard clearing the banner before a step's own actuation, and the capability gate leaving a backend
+without it unchanged.
+
+### Unit 8 — the proactive poll, for what the monitor cannot reach
+
+Unit 1 measured that a plain query never invokes the interruption monitor and never clears the
+banner. Everything Bajutsu does that is not an interaction therefore runs with the banner still on
+screen — a step's `after.png`, and with it every visual-regression comparison, which a banner
+overlapping the captured region corrupts outright. Unit 4 closes nothing here.
+
+This unit arms a guard that polls Unit 2's presence query on the bounded interval BE-0315 already
+established for the SpringBoard probe, and clears the banner through Unit 3's action the moment one
+is found. It is where a config- and scenario-level toggle belongs if one is wanted, following the
+same config-then-scenario, flag-overridable precedence
+([BE-0177](../BE-0177-run-behavior-target-config/BE-0177-run-behavior-target-config.md)) that
+`systemAlertHandling` established, since this half spends time on every step rather than only on an
+interrupted one.
 
 ### Prime directives preserved
 
-- **AI never judges.** The presence query and the swipe-dismiss action are both deterministic driver
-  calls; this item adds no new AI surface.
-- **Determinism first.** No fixed sleep: the guard polls on a bounded interval and dismisses the
-  banner by its measured frame, never by waiting out the banner's own auto-dismiss timeout.
-- **App-agnostic.** The toggle and the guard are generic runner mechanisms; no per-app code is added.
+- **AI never judges.** Recognition is an identifier comparison and the dismissal is a swipe; this
+  item adds no new AI surface.
+- **Determinism first.** No fixed sleep. The monitor confirms the swipe by bounded re-observation of
+  the banner's absence, and never waits out the banner's own auto-dismiss timeout — which Unit 1
+  measured is exactly what XCUITest does when nothing answers.
+- **App-agnostic.** The branch is a generic runner mechanism keyed on SpringBoard's own identifier;
+  no per-app code is added.
 
 ## Alternatives considered
 
@@ -204,16 +249,19 @@ path the way BE-0399's own test suite covers the alert monitor.
   established for a system alert: a process outside the application under test draws the banner, so
   `interrupts`' condition — evaluated only against the application's own tree — has nothing to check
   against.
-- **Dismiss the banner with a tap instead of a swipe.** Rejected: tapping a real banner opens the
-  notification's own app, which would navigate the run away from the scenario under test, the opposite
-  of clearing the banner. A swipe is the gesture that removes it without that side effect.
+- **Dismiss the banner with a tap instead of a swipe.** Rejected: the banner's one button is the
+  *open the notification's app* affordance, which would carry the run away from the scenario under
+  test. A swipe removes the banner without that side effect. Unit 1 measured that XCUITest's own
+  default handler never presses that button either, so this rules out a choice open to *this item*
+  rather than describing what happens today.
 - **Add an AI-vision fallback for a case the native query cannot resolve, mirroring the vision guard
   system alerts once had.** Rejected under prime directive 1. BE-0402 already removed the equivalent
   fallback from `run`'s system-alert path for the same reason: the banner's presence and frame are
   exactly the kind of fact a native query answers, with no judgment call for a model to make.
 - **Let the banner auto-dismiss on its own timeout instead of swiping it away.** Rejected under prime
-  directive 2 (no fixed sleep), and a banner that has not yet auto-dismissed is exactly the window in
-  which it interferes with a tap.
+  directive 2 (no fixed sleep). Unit 1 measured what that choice costs, because it is what XCUITest
+  already does when nothing answers: 9.18s per interrupted interaction against 0.58s undisturbed. A
+  banner set to the persistent style never auto-dismisses at all.
 
 ## Progress
 
@@ -221,18 +269,33 @@ path the way BE-0399's own test suite covers the alert monitor.
 > *Detailed design* (one box per unit of work); the log records what changed and when
 > (oldest first), linking the PRs.
 
-- [ ] Unit 1 — measure the banner's accessibility surface on a booted Simulator across the covered
-      iOS versions.
+- [x] Unit 1 — the banner's accessibility surface, measured on iOS 18.6 and 26.5. The answers, and
+      the two findings that reshaped Units 2–4, are recorded in *Detailed design* above.
 - [ ] Unit 2 — deterministic presence query (`Driver` method reporting the banner's frame or absence).
-- [ ] Unit 3 — deterministic swipe-dismiss action anchored to the measured frame.
-- [ ] Unit 4 — reactive guard wiring behind a config/scenario toggle, following the existing
-      precedence.
+      Scope narrowed by Unit 1: it serves Unit 8's proactive poll, not Unit 4.
+- [ ] Unit 3 — deterministic swipe-dismiss action anchored to the measured frame. Narrowed the same
+      way.
+- [x] Unit 4 — the interruption-monitor path: recognize the banner ahead of the policy, swipe it by
+      its own frame, confirm the clearance before claiming the interruption, and report it as an
+      `AlertEvent` under a kind of its own. Lands without the config/scenario toggle the proposal
+      called for — see *Unit 4* above for why Unit 1 removed the case for it.
 - [ ] Unit 5 — showcase fixture, including the app-side foreground banner presentation and a tap
       target inside the banner's frame, and on-device verification.
-- [ ] Unit 6 — docs (`docs/scenarios.md` + ja).
-- [ ] Unit 7 — tests.
-- [ ] Follow-up — close the poll-and-clear fallback's residual race window, once Unit 1's measurement
-      settles which path Unit 4 takes.
+- [x] Unit 6 — docs (`docs/scenarios.md`, `docs/architecture.md`, and both `docs/ja/` mirrors).
+- [x] Unit 7 — tests for what Unit 4 landed. The Unit 2/3/8 half remains with those units.
+- [ ] Unit 8 — the proactive poll, for the banner a run never interacts its way past: the corrupted
+      `after.png` and visual-regression capture Unit 1 measured the monitor cannot reach.
+
+Log:
+
+- 2026-09-11 — [#1975](https://github.com/bajutsu-e2e/bajutsu/pull/1975) — Unit 1 measured on dedicated Simulators (iPhone 17 Pro / iOS 26.5, iPhone 16 Pro /
+  iOS 18.6), and Units 2–4 rewritten against what it found. Unit 4 landed: the runner's interruption
+  monitor now recognizes a notification banner ahead of the alert policy, swipes it away by its own
+  measured frame, confirms the clearance before claiming the interruption, and reports it as an
+  `AlertEvent` carrying a `notificationBanner` kind. That removes the defect Unit 1 measured, where a
+  banner arriving during a run with `systemAlertHandling` on was recorded as an undeclared
+  interruption and failed an otherwise-passing step, naming the notification's body text among the
+  buttons the run had expected.
 
 ## References
 

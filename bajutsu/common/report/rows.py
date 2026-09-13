@@ -7,7 +7,7 @@ from typing import Any
 
 from bajutsu.common.drivers.actuation import Actuation
 from bajutsu.common.evidence import step_view
-from bajutsu.common.orchestrator import RunResult
+from bajutsu.common.orchestrator import AlertEvent, RunResult
 from bajutsu.common.report.format import (
     _ACTION_META,
     Part,
@@ -195,11 +195,16 @@ def _step_run_row(
         "view": _view_data(out, run_dir),
         "reason": out.reason if (not out.ok and out.reason) else None,
         "expand": None,
-        "alerts": [{"label": a.label} for a in out.alerts],
+        "alerts": _alert_rows(out.alerts),
         "actuations": _actuation_rows(out.actuations),
         "dropped_actuations": out.dropped_actuations,
         "generated": out.generated,
     }
+
+
+def _alert_rows(alerts: list[AlertEvent]) -> list[dict[str, Any]]:
+    """One display row per dismissed prompt, including its kind (an alert vs. a notification banner)."""
+    return [{"label": a.label, "kind": a.kind} for a in alerts]
 
 
 def _actuation_rows(actuations: list[Actuation]) -> list[dict[str, Any]]:
@@ -566,7 +571,7 @@ def _expects_data(r: RunResult, definition: dict[str, Any] | None) -> dict[str, 
         return {
             "label": "expectations",
             "rows": rows,
-            "alerts": [{"label": a.label} for a in r.expect_alerts],
+            "alerts": _alert_rows(r.expect_alerts),
             "actuations": _actuation_rows(r.expect_actuations),
             "dropped_expect_actuations": r.dropped_expect_actuations,
         }

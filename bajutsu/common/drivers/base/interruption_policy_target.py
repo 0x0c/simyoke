@@ -21,9 +21,10 @@ class InterruptionPolicyTarget(Protocol):
     `set_interruption_policy` hands over the labels `AlertGuardConfig` has already resolved (a rule's
     identifying label set with the label it taps) and whether the guard governs this scenario at all,
     so the decision stays in the orchestrator and the backend only applies it. `drain_interruptions`
-    takes back what it answered and what it declined, so a dismissal reaches the report as an
-    `AlertEvent` and an undeclared interruption can fail the step/expect that met it, rather than
-    either happening silently (BE-0406).
+    takes back what it answered, what it declined, and what it swiped away, so a dismissal reaches
+    the report as an `AlertEvent`, an undeclared interruption can fail the step/expect that met it
+    (BE-0406), and a foreground notification banner is told apart from a dismissed alert (BE-0416),
+    rather than any of the three happening silently.
     """
 
     def set_interruption_policy(
@@ -33,5 +34,5 @@ class InterruptionPolicyTarget(Protocol):
         ...
 
     def drain_interruptions(self) -> DrainedInterruptions:
-        """What the backend answered and declined since the last call, oldest first in each."""
+        """What the backend answered, declined, and swiped away since the last call, oldest first in each."""
         ...

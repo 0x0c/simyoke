@@ -342,12 +342,16 @@ paths:
   /interruptionPolicy/drain:
     post:
       operationId: drainInterruptions
-      summary: Take what the interruption monitor tapped and declined since the last drain.
+      summary: Take what the interruption monitor tapped, declined and swiped away since the last drain.
       description: >-
         The driver folds `labels` into the run's `AlertEvent`s, so a prompt answered at
         interruption time is not silently missing from the report. `unmatched` folds into
         `UndeclaredInterruption`s instead, so a governing policy's own decline can fail the step or
         `expect` that met it, naming the buttons, rather than passing in silence (BE-0406 Unit 2b).
+        `banners` folds into `AlertEvent`s too, but under their own kind: a notification banner is
+        dismissed by a swipe rather than a button press, so the report would otherwise carry it as a
+        dismissal that named no button — the shape an alert with no named button already has
+        (BE-0416).
       requestBody:
         required: false
         content:
@@ -356,7 +360,9 @@ paths:
               $ref: "#/components/schemas/EmptyRequest"
       responses:
         "200":
-          description: The labels tapped and the button lists declined since the last drain, oldest first.
+          description: >-
+            The labels tapped, the button lists declined, and the banners swiped away since the
+            last drain, oldest first within each.
           content:
             application/json:
               schema:
@@ -467,6 +473,16 @@ components:
             type: array
             items:
               type: string
+        banners:
+          type: array
+          description: >-
+            One entry per notification banner the monitor swiped away since the last drain,
+            folded in for the same reason as `labels` above. Its presence is *not* a second
+            signal of that fold: a runner between BE-0407 Unit 6 and BE-0416 carries `labels`
+            and `unmatched` and omits `banners`, so a client's fold-presence test keys on those
+            two alone. Separate from `labels` because a banner carries no button (BE-0416).
+          items:
+            type: string
     ErrorReply:
       type: object
       required: [status, message]
@@ -506,7 +522,7 @@ components:
           description: The label to press once this rule's prompt is identified.
     InterruptionsReply:
       type: object
-      required: [labels, unmatched]
+      required: [labels, unmatched, banners]
       properties:
         labels:
           type: array
@@ -522,6 +538,14 @@ components:
             type: array
             items:
               type: string
+        banners:
+          type: array
+          description: >-
+            The notification text of each foreground banner the monitor swiped away since the last
+            drain, oldest first (BE-0416). A banner is answered whether or not `governs` is set,
+            since it carries no button for a rule to identify.
+          items:
+            type: string
     EmptyRequest:
       type: object
       description: >-

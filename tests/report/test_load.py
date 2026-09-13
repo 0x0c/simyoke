@@ -76,7 +76,12 @@ def _result() -> RunResult:
         # wall_offset_s is deliberately left at its default: manifest_dict excludes it (BE-0348 —
         # see test_manifest.py's test_manifest_excludes_wall_offset_s), so a non-default value here
         # would make this round-trip test fail for a reason unrelated to what it checks.
-        expect_alerts=[AlertEvent("Dismiss")],
+        # One of each kind, so the discriminator that tells a swiped banner from a dismissed alert
+        # (BE-0416) is exercised by the round trip rather than only its default.
+        expect_alerts=[
+            AlertEvent("Dismiss"),
+            AlertEvent("Ready for Apple Intelligence", kind="notificationBanner"),
+        ],
         expect_actuations=[
             Actuation(gesture="systemAlert", via="handle", unit="point", target="alert.dismiss")
         ],

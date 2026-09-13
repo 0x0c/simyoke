@@ -63,6 +63,33 @@ def test_html_shows_dismissed_system_alert() -> None:
     assert "class='alertrow'" not in html_report("run1", [_passing()])
 
 
+def test_html_tells_a_swiped_notification_banner_apart_from_a_dismissed_alert() -> None:
+    # A banner carries no button, so its label is the notification's own text. Rendered under the
+    # alert wording it would read as a system alert dismissed by pressing that text — which is why
+    # the event carries a kind at all (BE-0416).
+    r = RunResult(
+        scenario="s1",
+        ok=True,
+        steps=[
+            StepOutcome(
+                index=0,
+                action="tap",
+                ok=True,
+                started_at=0.0,
+                alerts=[
+                    AlertEvent(label="Ready for Apple Intelligence", kind="notificationBanner")
+                ],
+            )
+        ],
+        expect_results=[],
+        artifacts=[],
+    )
+    out = html_report("run1", [r], definitions=[{"name": "s1", "steps": [{"tap": {"id": "a"}}]}])
+    assert 'act-alert">notification banner</span> swiped away' in out
+    assert 'act-alert">system alert' not in out
+    assert '<span class="tk str">“Ready for Apple Intelligence”</span>' in out
+
+
 def test_html_shows_expect_phase_dismissed_alert() -> None:
     # A prompt cleared right before the scenario-level expect re-checked is noted under
     # the expectations table (it belongs to no single step).
@@ -75,6 +102,17 @@ def test_html_shows_expect_phase_dismissed_alert() -> None:
     assert '<span class="tk str">“Allow”</span>' in out
     # No expect-phase dismissal -> no note.
     assert 'class="alertnote"' not in html_report("run1", [_passing()])
+
+
+def test_html_tells_a_swiped_banner_apart_from_a_dismissed_alert_in_the_expect_phase_note() -> None:
+    # The step-row and expect-phase notes share one macro (`alertline`); this pins the second call
+    # site independently, so the two cannot silently diverge on a later edit.
+    r = _passing()
+    r.expect_alerts = [AlertEvent(label="Ready for Apple Intelligence", kind="notificationBanner")]
+    out = html_report("run1", [r])
+    assert 'act-alert">notification banner</span> swiped away before re-checking' in out
+    assert 'act-alert">system alert' not in out
+    assert '<span class="tk str">“Ready for Apple Intelligence”</span>' in out
 
 
 def test_html_shows_the_value_a_generate_step_produced() -> None:

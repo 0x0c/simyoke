@@ -1213,6 +1213,37 @@ def test_drain_interruptions_reports_what_the_backend_declined_as_undeclared_int
     assert again.undeclared == []  # drained, not repeated
 
 
+def test_drain_interruptions_reports_a_swiped_banner_as_its_own_kind_of_alert_event() -> None:
+    # A banner cleared at interruption time is a dismissal, so it belongs in `alerts` — but under a
+    # kind of its own, since its `label` is the notification's text rather than a button anything
+    # pressed (BE-0416). Without the discriminator the report shows it as an alert dismissal naming
+    # a button that never existed.
+    from bajutsu.common.orchestrator import drain_interruptions
+
+    driver = FakeDriver([])
+    driver.interruptions_to_drain = ["Not Now"]
+    driver.banners_to_drain = ["Ready for Apple Intelligence"]
+    drained = drain_interruptions(driver)
+    assert drained.alerts == [
+        AlertEvent(label="Not Now"),
+        AlertEvent(label="Ready for Apple Intelligence", kind="notificationBanner"),
+    ]
+    again = drain_interruptions(driver)
+    assert again.alerts == []  # drained, not repeated onto the next step
+
+
+def test_a_swiped_banner_is_never_an_undeclared_interruption() -> None:
+    # The defect BE-0416 Unit 1 measured: a banner reaching the alert path could match no rule, so a
+    # governed run recorded it as undeclared and failed an otherwise-passing step, naming the
+    # notification's body text as a button. No scenario can declare a banner — it offers no button to
+    # identify — so failing over one would fail every run a notification happened to land in.
+    from bajutsu.common.orchestrator import drain_interruptions
+
+    driver = FakeDriver([])
+    driver.banners_to_drain = ["Ready for Apple Intelligence"]
+    assert drain_interruptions(driver).undeclared == []
+
+
 def test_a_gone_wait_is_guarded_so_an_in_app_prompt_can_be_cleared() -> None:
     # `gone` went unguarded on the reasoning that a blocking prompt collapses the tree, which already
     # satisfies "gone". That holds for a SpringBoard prompt and only for those: iOS's "Save Password"

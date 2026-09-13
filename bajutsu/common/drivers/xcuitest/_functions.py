@@ -152,38 +152,54 @@ def _decode(path: str, status_code: int, body: bytes) -> _Reply:
     return _Reply(status=str(status), elements=elements, size=size, raw=body)
 
 
-def _parse_drain_fold(raw: bytes | None) -> base.DrainedInterruptions:
-    """Read `labels`/`unmatched` off a reply body, empty when either is absent or unparseable.
+def _string_list(value: object) -> list[str]:
+    """A reply field read as a list of strings — empty unless it really is a list."""
+    return [str(item) for item in value] if isinstance(value, list) else []
 
-    For the standalone `/interruptionPolicy/drain` reply, whose schema requires both fields, so
-    "absent" only ever means a body-less or malformed reply — never a meaningful distinction from
-    "present but empty". `_parse_tap_drain_fold` is the sibling reader for a `/tap` reply, where that
-    distinction *is* meaningful (BE-0407 Unit 6) and is not safe to collapse the same way.
+
+def _parse_drain_fold(raw: bytes | None) -> base.DrainedInterruptions:
+    """Read `labels`/`unmatched`/`banners` off a reply body, empty for any that is absent or unparseable.
+
+    For the standalone `/interruptionPolicy/drain` reply. Its schema has always required
+    `labels`/`unmatched`, so for those "absent" only ever means a body-less or malformed reply — never
+    a meaningful distinction from "present but empty". `banners` (BE-0416) collapses the same way for
+    a different reason, given at the fold below: a runner predating it legitimately omits the field,
+    so this reader must not be tightened into rejecting or warning on its absence.
+    `_parse_tap_drain_fold` is the sibling reader for a `/tap` reply, where that distinction *is*
+    meaningful (BE-0407 Unit 6) and is not safe to collapse the same way.
     """
     if not raw:
-        return base.DrainedInterruptions(tapped=[], declined=[])
+        return base.DrainedInterruptions.empty()
     body = json.loads(raw)
-    labels = body.get("labels")
     unmatched = body.get("unmatched")
-    tapped = [str(label) for label in labels] if isinstance(labels, list) else []
     declined = (
-        [[str(button) for button in group] for group in unmatched if isinstance(group, list)]
+        [_string_list(group) for group in unmatched if isinstance(group, list)]
         if isinstance(unmatched, list)
         else []
     )
-    return base.DrainedInterruptions(tapped=tapped, declined=declined)
+    # A runner predating BE-0416 omits `banners` entirely; an empty list is the same answer as far as
+    # any caller is concerned, since such a runner never swiped a banner away to report.
+    return base.DrainedInterruptions(
+        tapped=_string_list(body.get("labels")),
+        declined=declined,
+        banners=_string_list(body.get("banners")),
+    )
 
 
 def _parse_tap_drain_fold(raw: bytes | None) -> base.DrainedInterruptions | None:
     """The optional drain fold folded into a `/tap` reply (BE-0407 Unit 6), or `None` when absent.
 
-    Unlike the standalone drain endpoint, `/tap`'s `labels`/`unmatched` are optional in its schema —
-    always present on a runner that supports Unit 6 (`withDrain` folds every tap's own drain in,
-    empty arrays included), and always absent on one that predates it, such as a pinned older
-    `testRunner` build (`targets.<name>.xcuitest.testRunner`). Absence, not a merely empty pair, is
-    therefore what says "this runner never drained anything for this tap" — trusting an empty pair as
+    Unlike the standalone drain endpoint, `/tap`'s fold fields are optional in its schema — always
+    present on a runner that supports Unit 6 (`withDrain` folds every tap's own drain in, empty
+    arrays included), and always absent on one that predates it, such as a pinned older
+    `testRunner` build (`targets.<name>.xcuitest.testRunner`). Absence, not a merely empty fold, is
+    therefore what says "this runner never drained anything for this tap" — trusting an empty fold as
     if it meant the same thing would let a pre-Unit-6 runner's real interruptions go unreported the
     caller believes it already asked for.
+
+    `banners` (BE-0416) is deliberately *not* part of that presence test: a runner between Unit 6 and
+    BE-0416 folds the other two and omits it, and reading its absence as "no fold at all" would send
+    every tap back to the wire for a drain the reply already answered.
     """
     if not raw:
         return None

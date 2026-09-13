@@ -269,7 +269,7 @@ def test_test_extra_carries_bajutsu_surplus() -> None:
     assert extra["backend"] == "xcuitest"
     assert extra["sid"] == "00-s"
     assert extra["expect"] == [{"ok": True, "kind": "exists", "detail": "home.title", "reason": ""}]
-    assert extra["expectAlerts"] == [{"label": "Not Now"}]
+    assert extra["expectAlerts"] == [{"label": "Not Now", "kind": "alert"}]
     assert extra["skippedCaptures"] == [{"kind": "network", "reason": "no eligible backend"}]
 
 

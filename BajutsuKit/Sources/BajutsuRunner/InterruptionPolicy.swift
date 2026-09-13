@@ -65,7 +65,40 @@ public struct InterruptionPolicy: Sendable, Equatable {
     }
 }
 
-/// The live interruption policy, plus what the monitor has tapped and declined since the last drain.
+/// The identifier SpringBoard gives a foreground notification banner (BE-0416 Unit 1).
+///
+/// Measured on iOS 26.5: the banner is a SpringBoard element carrying this identifier, with the
+/// notification's own text as its label and a single descendant button — `ShortLook.Platter.Content
+/// .Seamless` — whose label is that same text. That button is the *open the notification's app*
+/// affordance, so nothing here may tap it; a banner is cleared by an upward swipe instead.
+public let notificationBannerIdentifier = "NotificationShortLookView"
+
+/// Whether an interrupting element is a foreground notification banner rather than an alert.
+///
+/// Kept beside the policy, and matched on the identifier alone, because the two facts that would
+/// otherwise distinguish a banner are both unusable: its element type is an undocumented raw value,
+/// and its only button's label is the notification's own text, which varies per notification and per
+/// locale.
+///
+/// The distinction matters twice over. A banner reaching `InterruptionPolicy.label(for:)` can never
+/// match a rule — the scenario declares prompts by button label, and a banner has no such button —
+/// so before this existed a governed run recorded it as an *undeclared interruption* and failed an
+/// otherwise-passing step, naming the notification's body text as a button it had expected to find
+/// (BE-0416 Unit 1, measured). And a banner is the one interruption XCUITest's own default handler
+/// cannot press a button on: it waits the banner out instead, which is why an interrupted
+/// interaction with an auto-dismissing banner cost ~9s against ~0.6s undisturbed. A persistent-style
+/// banner never auto-dismisses; Unit 1 measured XCUITest clearing that one by some other means, in
+/// ~3.5s — so the wait-it-out account, and the ~9s it explains, hold for the auto-dismissing case.
+public func isNotificationBanner(identifier: String) -> Bool {
+    identifier == notificationBannerIdentifier
+}
+
+/// SpringBoard's own bundle identifier, shared by every site that opens an `XCUIApplication` handle
+/// onto it — the system-alert query, the banner query, and the banner's own dismiss swipe.
+public let springboardBundleID = "com.apple.springboard"
+
+/// The live interruption policy, plus what the monitor has tapped, declined, and swiped away since
+/// the last drain.
 ///
 /// A shared store rather than a value threaded through `ElementProviding`, because the two sides
 /// that need it never meet: the policy arrives on a server thread (`POST /interruptionPolicy`),
@@ -75,7 +108,8 @@ public struct InterruptionPolicy: Sendable, Equatable {
 /// The drained tapped labels are what lets the Python side report an interruption-time dismissal as
 /// an `AlertEvent`, so a prompt answered here is not silently missing from the run's report. The
 /// drained declined button lists do the same for an alert nothing answered on the scenario's behalf
-/// (BE-0406 Unit 2b): the failure mode this whole mechanism exists to end covers both.
+/// (BE-0406 Unit 2b), and the drained banners do it for a foreground notification banner swiped away
+/// (BE-0416): the failure mode this whole mechanism exists to end covers all three.
 public final class InterruptionPolicyStore: @unchecked Sendable {
     public static let shared = InterruptionPolicyStore()
 
@@ -83,6 +117,7 @@ public final class InterruptionPolicyStore: @unchecked Sendable {
     private var _policy = InterruptionPolicy()
     private var _tapped: [String] = []
     private var _declined: [[String]] = []
+    private var _banners: [String] = []
 
     public init() {}
 
@@ -101,6 +136,7 @@ public final class InterruptionPolicyStore: @unchecked Sendable {
         _policy = policy
         _tapped = []
         _declined = []
+        _banners = []
     }
 
     public func record(_ label: String) {
@@ -116,14 +152,27 @@ public final class InterruptionPolicyStore: @unchecked Sendable {
         _declined.append(buttons)
     }
 
-    /// Returns what was tapped and declined since the last drain, and clears both.
-    public func drain() -> (tapped: [String], declined: [[String]]) {
+    /// Records a notification banner the monitor swiped away, by the notification's own text.
+    ///
+    /// Separate from `record` because the two are not the same event: `record` names the *button*
+    /// the policy chose, while a banner has none and is identified by its content. The Python side
+    /// keeps them apart in the report for the same reason (BE-0416).
+    public func recordBanner(_ label: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        _banners.append(label)
+    }
+
+    /// Returns what was tapped, declined and swiped away since the last drain, and clears all three.
+    public func drain() -> (tapped: [String], declined: [[String]], banners: [String]) {
         lock.lock()
         defer { lock.unlock() }
         let tapped = _tapped
         let declined = _declined
+        let banners = _banners
         _tapped = []
         _declined = []
-        return (tapped, declined)
+        _banners = []
+        return (tapped, declined, banners)
     }
 }

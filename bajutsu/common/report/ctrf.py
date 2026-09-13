@@ -119,7 +119,7 @@ def _test_extra(r: RunResult) -> dict[str, object]:
             for a in r.expect_results
         ]
     if r.expect_alerts:
-        extra["expectAlerts"] = [{"label": a.label} for a in r.expect_alerts]
+        extra["expectAlerts"] = [{"label": a.label, "kind": a.kind} for a in r.expect_alerts]
     if r.skipped_captures:
         extra["skippedCaptures"] = [
             {"kind": c.kind, "reason": c.reason} for c in r.skipped_captures

@@ -147,10 +147,7 @@ class XcuitestDriver:
             if fold is None:
                 carry.is_current = False
                 return reply
-            carry.drained = base.DrainedInterruptions(
-                tapped=carry.drained.tapped + fold.tapped,
-                declined=carry.drained.declined + fold.declined,
-            )
+            carry.drained = carry.drained.merged_with(fold)
             carry.is_current = True
             return reply
 
@@ -666,7 +663,7 @@ class XcuitestDriver:
             raise XcuitestChannelError(f"setting the interruption policy failed ({reply.status})")
 
     def drain_interruptions(self) -> base.DrainedInterruptions:
-        """What the runner's interruption monitor tapped and declined since the last drain.
+        """What the runner's interruption monitor tapped, declined and swiped away since the last drain.
 
         Whatever this driver's own `/tap` replies have already carried (`self._drain_carry`,
         BE-0407 Unit 6, accumulated by `_tracking_transport` in `__init__`) is never dropped, only
@@ -680,7 +677,7 @@ class XcuitestDriver:
         carried = carry.drained
         if carry.is_current:
             carry.is_current = False
-            carry.drained = base.DrainedInterruptions(tapped=[], declined=[])
+            carry.drained = base.DrainedInterruptions.empty()
             return carried
         # Cleared only once the wire has answered *and* its fold parsed: a drain that raises must
         # leave the carry intact, or whatever it held (a genuinely tapped/declined label the fold
@@ -688,10 +685,8 @@ class XcuitestDriver:
         # on the failure path where the eventual report needs it most.
         reply = self._transport("POST", "/interruptionPolicy/drain", {})
         fresh = _parse_drain_fold(reply.raw)
-        carry.drained = base.DrainedInterruptions(tapped=[], declined=[])
-        return base.DrainedInterruptions(
-            tapped=carried.tapped + fresh.tapped, declined=carried.declined + fresh.declined
-        )
+        carry.drained = base.DrainedInterruptions.empty()
+        return carried.merged_with(fresh)
 
     def dismiss_blocking_tip(self, tree: list[base.Element] | None = None) -> bool:
         """Dismiss a showing TipKit tip via its dismiss region; False when no tip is up.

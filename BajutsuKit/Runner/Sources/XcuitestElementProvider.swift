@@ -30,7 +30,7 @@ final class XcuitestElementProvider: ElementProviding {
     private let app: XCUIApplication
     // A second, on-demand handle for SpringBoard — which owns the out-of-process permission prompt
     // (BE-0316) — built lazily so every other query and tap stays scoped to the app under test.
-    private lazy var springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+    private lazy var springboard = XCUIApplication(bundleIdentifier: springboardBundleID)
     // A third handle for the process that draws `SFSafariViewController` (BE-0396), built lazily for
     // the same reason: a run that never opens a browser never touches it.
     private lazy var safariViewService = XCUIApplication(bundleIdentifier: Self.safariViewServiceID)
