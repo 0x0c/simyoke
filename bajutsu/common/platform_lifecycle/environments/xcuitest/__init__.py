@@ -23,12 +23,15 @@ from ._functions import _allocate_port as _allocate_port
 from ._functions import _await_cold_runner as _await_cold_runner
 from ._functions import _classify_runner as _classify_runner
 from ._functions import _destination as _destination
+from ._functions import _diagnostic_reports_dir as _diagnostic_reports_dir
 from ._functions import _major as _major
 from ._functions import _max_warm_reuses as _max_warm_reuses
 from ._functions import _never_ended as _never_ended
 from ._functions import _no_recovery as _no_recovery
 from ._functions import _patch_xctestrun_env as _patch_xctestrun_env
 from ._functions import _recovery_timeout as _recovery_timeout
+from ._functions import _reported_pid as _reported_pid
+from ._functions import _reports_since as _reports_since
 from ._functions import _resolve_runner as _resolve_runner
 from ._functions import _respawn_timeout as _respawn_timeout
 from ._functions import _run_ended_probe as _run_ended_probe

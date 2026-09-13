@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import plistlib
 import shlex
@@ -250,6 +251,61 @@ def _max_warm_reuses() -> int:
 
 def _never_ended() -> str | None:
     """The neutral run-ended probe: a spawn with no capture to read can only be judged by its process."""
+    return None
+
+
+def _diagnostic_reports_dir() -> Path | None:
+    """Where macOS's `ReportCrash` writes a per-user crash report, or None when it cannot be located.
+
+    Resolved on demand rather than at import (BE-0421): `Path.home()` raises when no home directory
+    can be resolved — a container started against a uid with no passwd entry and no `HOME` — and this
+    module is imported on every platform, including the Linux lanes that have no report store to read
+    in the first place. An unresolvable home reads as "no reports", the same first-class answer a
+    missing directory already gives.
+    """
+    try:
+        home = Path.home()
+    except RuntimeError:
+        return None
+    return home / "Library" / "Logs" / "DiagnosticReports"
+
+
+def _reports_since(reports_dir: Path, pattern: str, since: float) -> list[Path]:
+    """Crash reports matching *pattern* in *reports_dir* modified at or after *since*, newest first.
+
+    The name-and-time half of BE-0421's crash-report match: the pattern keeps an unrelated process's
+    report out, and *since* — the crashed runner's spawn timestamp — keeps an earlier invocation's
+    report on the same host out. Never raises: `Path.glob` answers a directory that is missing (every
+    platform but macOS has none) or unreadable with no entries at all, and an entry that vanishes
+    between the listing and its `stat` is skipped, since a report store is a live directory.
+    """
+    found: list[tuple[float, Path]] = []
+    for path in reports_dir.glob(pattern):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime >= since:
+            found.append((mtime, path))
+    return [path for _, path in sorted(found, key=lambda pair: pair[0], reverse=True)]
+
+
+def _reported_pid(report: bytes) -> int | None:
+    """The process id an `.ips` crash report names, or `None` when it names none this can read.
+
+    An `.ips` file is two JSON documents: a one-line header naming the process and its version, then
+    the payload carrying the fault itself. The pid lives in the payload on the reports measured, but
+    the header is checked first because it is the cheaper and more stable of the two. Returning `None`
+    is a real answer — the caller then matches on name and time alone (BE-0421).
+    """
+    header, _, payload = report.partition(b"\n")
+    for document in (header, payload):
+        try:
+            parsed = json.loads(document)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(parsed, dict) and isinstance(pid := parsed.get("pid"), int):
+            return pid
     return None
 
 

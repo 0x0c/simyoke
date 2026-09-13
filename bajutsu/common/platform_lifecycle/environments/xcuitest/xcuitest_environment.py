@@ -30,11 +30,14 @@ from ._attempt_failure import _AttemptFailure
 from ._functions import (
     _allocate_port,
     _destination,
+    _diagnostic_reports_dir,
     _max_warm_reuses,
     _never_ended,
     _no_recovery,
     _patch_xctestrun_env,
     _recovery_timeout,
+    _reported_pid,
+    _reports_since,
     _resolve_runner,
     _respawn_timeout,
     _run_ended_probe,
@@ -71,6 +74,18 @@ _RUNNER_LOG_TAIL_LINES = 20
 # variable *is* the operator asking for the bundles, so every one is kept (unlike the runner log
 # above, whose env-unset default capture teardown prunes).
 _RESULT_BUNDLE_ENV = "BAJUTSU_XCUITEST_RESULT_BUNDLES"
+
+# Lines of captured runner output copied into the failed scenario's own evidence directory (BE-0421).
+# Deliberately far above `_RUNNER_LOG_TAIL_LINES`: this artifact exists precisely because the 20-line
+# hint folded into the crash warning was too short to diagnose from, and it is read the same streaming
+# way, so the larger cap costs a longer `deque` and nothing else.
+_CRASH_LOG_TAIL_LINES = 500
+
+# Reports one crash episode may copy, mirroring BE-0361's own per-capture caps: a runner that
+# crash-loops on one host leaves a report per fault, and one scenario's evidence must stay bounded
+# regardless. The name-and-time match below usually leaves exactly one, so this only bounds the case
+# where several concurrent workers' `xcodebuild` processes faulted within the same window.
+_MAX_CRASH_REPORTS = 3
 
 
 # Probing a *warm* runner before reuse (BE-0291): a live runner answers /health at once, so this only
@@ -114,6 +129,11 @@ class XcuitestEnvironment(_DeviceEnvironment):
         # `_respawn`, which a reused instance built at first bring-up never has set.
         self._cold_spawned_before = False
         self._runner_proc: subprocess.Popen[bytes] | None = None
+        # Wall-clock seconds at which `_runner_proc` was spawned (BE-0421). `Popen` exposes no start
+        # time of its own, and a crash report's modification time is what tells this run's report apart
+        # from an unrelated `xcodebuild` invocation's left on the same host. Wall clock, not monotonic,
+        # because it is compared against a file's `st_mtime`.
+        self._runner_spawned_at: float = 0.0
         self._runner_port: int = 0
         self._patched_runner: Path | None = None
         # Where the current runner's captured output went; a mid-run-crash warning and a startup
@@ -165,6 +185,20 @@ class XcuitestEnvironment(_DeviceEnvironment):
         # The in-app `nativeZ` responder client for the launch this environment last started
         # (BE-0355); None until a `start` sees a port in its launch env.
         self._zorder: ZOrderSource | None = None
+        # What the last observed mid-run crash captured, for the failed scenario's own evidence
+        # directory (BE-0421): the runner log's tail, read eagerly at the moment of the crash, and the
+        # criteria that identify the crashed process's macOS crash report, frozen at that same moment.
+        # Both are snapshots rather than live reads, because the crashed lease is released back to the
+        # pool before the retry loop gives up — so a later lease on this same device can have respawned
+        # a runner, and cleared `_runner_log` / `_runner_proc`, before anyone reads these back.
+        self._last_crash_artifacts: list[tuple[str, bytes]] = []
+        # `(spawn timestamp, pid)` of the crashed runner, or None when no crash has been observed.
+        self._last_crash_report_match: tuple[float, int] | None = None
+        # Whether the current spawn's crash has already been captured. Reset per spawn, so each crash
+        # is snapshotted once however many sites observe it: `end_lease` sees a crash first, and the
+        # next bring-up's discard would otherwise re-capture the same dead runner — regenerating
+        # evidence the releasing lease has already taken ownership of, for a later scenario to inherit.
+        self._crash_snapshotted = False
 
     def start(
         self,
@@ -767,6 +801,8 @@ class XcuitestEnvironment(_DeviceEnvironment):
             # closing on the error path too means a failed spawn never leaks the log handle.
             runner_out.close()
         self._runner_proc = proc
+        self._runner_spawned_at = time.time()
+        self._crash_snapshotted = False
         _logger.info("xcuitest runner output → %s", self._runner_log)
 
         driver = backends.make_driver(
@@ -1139,6 +1175,120 @@ class XcuitestEnvironment(_DeviceEnvironment):
             pass  # the log may not exist yet on a spawn that failed before writing
         return f"; see {self._runner_log}" + (f"\n{tail}" if tail else "")
 
+    def _runner_crashed(self) -> bool:
+        """Whether the runner this environment holds died on its own, rather than at our request.
+
+        The same two signals `_runner_alive` declares a mid-run crash on, asked from the teardown side:
+        the `xcodebuild` leader exited, *or* its capture carries the marker saying the XCTest run
+        ended while the process lingers. The second is the shape a stalled screenshot service
+        produces — the dominant one in CI — and it leaves `poll()` answering `None` throughout, so a
+        check that only looked at the process would miss exactly the crash this capture exists for.
+        The run-ended probe latches (BE-0354), so asking it here does not consume the answer
+        `_runner_alive` already read.
+        """
+        if self._runner_proc is None:
+            return False
+        return self._runner_proc.poll() is not None or self._run_ended() is not None
+
+    def _capture_crash_if_observed(self) -> None:
+        """Snapshot this spawn's crash, at most once however many sites observe it (BE-0421).
+
+        Two do: the lease's own release, which is where a crashed runner is first let go, and any
+        discard that later finds one. Capturing twice would regenerate evidence the releasing lease has
+        already taken ownership of, leaving it on this environment for the next scenario on the device
+        to be handed under its own id.
+        """
+        if not self._crash_snapshotted and self._runner_crashed():
+            self._snapshot_crash_artifacts()
+
+    def _snapshot_crash_artifacts(self) -> None:
+        """Capture the just-crashed runner's evidence, at the moment the crash is observed (BE-0421).
+
+        Called where a crashed runner is first let go — the lease's own release, and any discard that
+        finds one — so the capture is already taken before the pipeline puts this device back in the
+        pool. A `crash_artifacts()` that read the live fields lazily would race a concurrent worker
+        whose next lease reuses this same environment instance (the pool keys its warm cache by udid)
+        and respawns a runner on it, clearing both fields before the crashed scenario's retry loop
+        ever gives up and asks.
+
+        The two pieces have different windows, so they are captured differently. The runner log is
+        read *here*, as a bounded tail, because the file it names can be pruned and the field
+        re-pointed within milliseconds. Pruned genuinely: BE-0319's retention keeps an ephemeral
+        capture only for the *exited* crash, so for a runner that lingers past its ended test run the
+        copy taken here is the only thing that survives the next bring-up. The macOS crash report is
+        only *identified* here —
+        `ReportCrash` writes and symbolicates it asynchronously, after the faulting process is gone,
+        so listing for it now would usually find nothing. Freezing the criteria is what lets the
+        lookup wait: by the time `crash_artifacts()` runs, the live spawn timestamp and process handle
+        may belong to a later spawn, but the frozen pair still names the one that crashed.
+        """
+        self._crash_snapshotted = True
+        artifacts: list[tuple[str, bytes]] = []
+        if self._runner_log is not None:
+            try:
+                with self._runner_log.open("r", errors="replace") as fh:
+                    tail = "".join(deque(fh, maxlen=_CRASH_LOG_TAIL_LINES))
+            except OSError as exc:
+                # Best-effort throughout: a capture that failed to start writing, or a log already
+                # gone, costs this one entry — never the failure being diagnosed.
+                _logger.debug("xcuitest: cannot read the crashed runner's capture (%s)", exc)
+            else:
+                artifacts.append((self._runner_log.name, tail.encode()))
+        self._last_crash_artifacts = artifacts
+        self._last_crash_report_match = (
+            (self._runner_spawned_at, self._runner_proc.pid)
+            if self._runner_proc is not None
+            else None
+        )
+
+    def take_crash_snapshot(self) -> Callable[[], list[tuple[str, bytes]]]:
+        """Move the last observed crash's evidence to the releasing lease (BE-0421).
+
+        Taken, not read: this environment is kept warm per device, so a snapshot left here would be
+        visible to the next scenario that leases the device, and cleared by it. Handing ownership over
+        at release makes the evidence lease-local, which is what keeps a `workers > 1` run from
+        crossing one scenario's crash with another's — the same rule `video_start_stalled` follows.
+
+        The thunk closes over the values taken here and still defers the `.ips` lookup to its own
+        call, which is the whole reason the criteria were frozen rather than the bytes read: the
+        pipeline asks after the retry loop has given up, which is the delay `ReportCrash` needs. The
+        deferral is safe precisely because the frozen pair is now the thunk's, not the environment's.
+        """
+        artifacts, match = self._last_crash_artifacts, self._last_crash_report_match
+        self._last_crash_artifacts, self._last_crash_report_match = [], None
+        if match is None:
+            return lambda: list(artifacts)
+        return lambda: [*artifacts, *self._crash_reports(*match)]
+
+    def _crash_reports(self, spawned_at: float, pid: int) -> list[tuple[str, bytes]]:
+        """The `.ips` reports macOS wrote for the crashed `xcodebuild`, newest first and bounded.
+
+        Matched on name and modification time, so an unrelated `xcodebuild` invocation's report left
+        on the same host is not swept up. A report whose own JSON names a `pid` is additionally
+        matched against the crashed one, which separates the several concurrent `xcodebuild` processes
+        a multi-worker host runs; one that cannot be parsed is still taken on name and time alone,
+        since a report format this cannot read is exactly when the raw file is worth having.
+        """
+        # A store that cannot be located, is missing — every platform but macOS — or is unreadable on a
+        # sandboxed CI runner all read as empty rather than raising: no report is a first-class answer.
+        reports_dir = _diagnostic_reports_dir()
+        if reports_dir is None:
+            return []
+        reports: list[tuple[str, bytes]] = []
+        for path in _reports_since(reports_dir, "xcodebuild-*.ips", spawned_at):
+            try:
+                content = path.read_bytes()
+            except OSError as exc:
+                _logger.debug("xcuitest: cannot read the crash report %s (%s)", path, exc)
+                continue
+            reported = _reported_pid(content)
+            if reported is not None and reported != pid:
+                continue
+            reports.append((path.name, content))
+            if len(reports) == _MAX_CRASH_REPORTS:
+                break
+        return reports
+
     def _discard_runner(self, *, warn_on_crash: bool = True, keep_log: bool = False) -> None:
         """Terminate the runner process and remove its patched .xctestrun (kills the warm resident).
 
@@ -1167,6 +1317,13 @@ class XcuitestEnvironment(_DeviceEnvironment):
         left to reach anyway — is the pid free to be reused, the same narrow window the `else` branch
         below already accepts unconditionally via `_terminate_process_group`.
         """
+        # Before any of the teardown below moves the state a capture reads. Gated on `warn_on_crash`
+        # rather than on the `crashed` flag computed further down: a cold-spawn-failure discard is
+        # explicitly not a mid-run crash, and must not overwrite a real crash's evidence with its own
+        # mid-retry-loop — while a runner that lingers past its ended test run, which that flag does
+        # not see at all, is the very shape this capture exists for (BE-0421).
+        if warn_on_crash:
+            self._capture_crash_if_observed()
         crashed = False
         if self._runner_proc is not None:
             exited = self._runner_proc.poll()
@@ -1282,6 +1439,14 @@ class XcuitestEnvironment(_DeviceEnvironment):
         return self._udid if self._replaced_from is not None else None
 
     def end_lease(self, driver: base.Driver, eff: Effective) -> None:
+        # A crashed runner's evidence is captured *here*, because this is the last moment it is still
+        # this scenario's: the pool frees the device right after, and the next lease can reuse this
+        # same environment and respawn over the crashed runner's state before the crashed scenario's
+        # retry loop has even given up and asked for it (BE-0421). The discard that would otherwise
+        # notice runs at that next bring-up, which is already too late.
+        self._capture_crash_if_observed()
+        # Nothing to clear on the healthy path: the pool takes the snapshot off this environment right
+        # after this returns (`take_crash_snapshot`), so a lease never inherits a previous one's.
         # Keep the warm runner alive for the next lease on this device; terminate only the app, the
         # same per-scenario cleanup a cold lease does (BE-0291). The pool tears the runner down later
         # (run-set end / actuator switch) via teardown.

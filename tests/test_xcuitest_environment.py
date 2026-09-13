@@ -10,6 +10,7 @@ loud refusal of simctl-only operations against a real device are exercised witho
 
 from __future__ import annotations
 
+import os
 import plistlib
 import re
 import signal
@@ -40,8 +41,10 @@ from bajutsu.common.platform_lifecycle.environments.xcuitest import (
     _AttemptFailure,
     _await_cold_runner,
     _destination,
+    _diagnostic_reports_dir,
     _Recovery,
     _recovery_timeout,
+    _reports_since,
     _respawn_timeout,
     _run_ended_probe,
     _runner_host_bundle_ids,
@@ -3003,3 +3006,312 @@ def test_a_replacements_name_keeps_its_capability_token_and_report_row(tmp_path:
     assert (
         f"bajutsu-recovered-{old_udid}" in name
     )  # the *whole* vanished udid, not a truncated prefix
+
+
+# --- copying the crashed runner's own evidence into the failed scenario (BE-0421) --- #
+#
+# A scenario whose crash-recovery retries all exhausted used to report only that the runner died. Two
+# pieces of direct evidence exist on disk at that moment — the runner's captured output, and the
+# `.ips` report macOS writes for a process that faulted — and the pipeline now copies both into that
+# scenario's own evidence directory. Both halves are snapshotted where the crash is *observed*, since
+# the crashed lease is back in the pool before the retry loop gives up.
+
+_XCUITEST_MODULE = "bajutsu.common.platform_lifecycle.environments.xcuitest.xcuitest_environment"
+
+_IPS_HEADER = b'{"app_name":"xcodebuild","bug_type":"309"}'
+
+
+def _write_ips(directory: Path, name: str, *, pid: int | None, when: float) -> Path:
+    """A stub `.ips` crash report in *directory*, dated *when*, naming *pid* unless it is None."""
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = b'{"exception":{"signal":"SIGSEGV"}}' if pid is None else b'{"pid":%d}' % pid
+    path = directory / name
+    path.write_bytes(_IPS_HEADER + b"\n" + payload)
+    os.utime(path, (when, when))
+    return path
+
+
+def _crashed_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[XcuitestEnvironment, Path]:
+    """An environment with a spawned-then-crashed runner, its capture and report store under *tmp_path*.
+
+    Returned before the discard, so each test writes the reports it wants the deferred sweep to find
+    and then calls `_discard_runner()` itself — the point where the snapshot is taken.
+    """
+    _, _, run = _fake_toolchain(monkeypatch)
+    monkeypatch.delenv("BAJUTSU_XCUITEST_RUNNER_LOG", raising=False)
+    monkeypatch.setattr(
+        f"{_XCUITEST_MODULE}._DEFAULT_RUNNER_LOG_DIR",
+        tmp_path / "runner-logs",
+    )
+    reports = tmp_path / "DiagnosticReports"
+    monkeypatch.setattr(f"{_XCUITEST_MODULE}._diagnostic_reports_dir", lambda: reports)
+    _patch_group_signals(monkeypatch)
+    env = XcuitestEnvironment("xcuitest", "UDID", env_run=run)
+    env.start(_sim_eff(test_runner=str(_write_runner(tmp_path))), Preconditions())
+    assert env._runner_log is not None
+    env._runner_log.write_text("first line\nthe crash reason\n", encoding="utf-8")
+    assert env._runner_proc is not None
+    env._runner_proc.alive = False  # type: ignore[attr-defined]  # the runner crashed mid-run
+    return env, reports
+
+
+def test_a_mid_run_crash_copies_the_runner_log_and_the_matching_crash_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The observable outcome of BE-0421: both pieces of evidence reach the caller as named bytes, and
+    # the report is found on the *deferred* sweep — written here after the discard has already run,
+    # which is exactly the ordering `ReportCrash`'s asynchronous write imposes.
+    env, reports = _crashed_runner(monkeypatch, tmp_path)
+    log_name = env._runner_log.name if env._runner_log is not None else ""
+    pid = env._runner_proc.pid if env._runner_proc is not None else 0
+    spawned_at = env._runner_spawned_at
+    env._discard_runner()
+    _write_ips(reports, "xcodebuild-2026-09-12-103045.ips", pid=pid, when=spawned_at + 1)
+    captured = dict(env.take_crash_snapshot()())
+    assert captured[log_name] == b"first line\nthe crash reason\n"
+    assert b'"pid":%d' % pid in captured["xcodebuild-2026-09-12-103045.ips"]
+
+
+def test_a_crash_report_predating_the_spawn_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A macOS host accumulates reports, so an `xcodebuild` invocation from an hour ago leaves one that
+    # names the same process and says nothing about this crash. The frozen spawn timestamp is what
+    # keeps it out.
+    env, reports = _crashed_runner(monkeypatch, tmp_path)
+    log_name = env._runner_log.name if env._runner_log is not None else ""
+    pid = env._runner_proc.pid if env._runner_proc is not None else 0
+    spawned_at = env._runner_spawned_at
+    env._discard_runner()
+    _write_ips(reports, "xcodebuild-old.ips", pid=pid, when=spawned_at - 3600)
+    assert [name for name, _ in env.take_crash_snapshot()()] == [log_name]  # the runner log alone
+
+
+def test_a_crash_report_naming_a_different_process_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A multi-worker host runs several `xcodebuild` processes at once, so name and time alone can match
+    # a sibling worker's fault. The frozen pid separates them.
+    env, reports = _crashed_runner(monkeypatch, tmp_path)
+    pid = env._runner_proc.pid if env._runner_proc is not None else 0
+    spawned_at = env._runner_spawned_at
+    env._discard_runner()
+    _write_ips(reports, "xcodebuild-sibling.ips", pid=pid + 1, when=spawned_at + 1)
+    assert "xcodebuild-sibling.ips" not in dict(env.take_crash_snapshot()())
+
+
+def test_a_crash_report_whose_json_cannot_be_read_is_still_taken(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A report format this cannot parse is precisely when the raw file is worth having, so an
+    # unreadable header degrades to the name-and-time match rather than dropping the evidence.
+    env, reports = _crashed_runner(monkeypatch, tmp_path)
+    spawned_at = env._runner_spawned_at
+    env._discard_runner()
+    path = reports / "xcodebuild-unparsable.ips"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not json at all\nnor here either\n")
+    os.utime(path, (spawned_at + 1, spawned_at + 1))
+    assert "xcodebuild-unparsable.ips" in dict(env.take_crash_snapshot()())
+
+
+def test_the_crash_report_sweep_is_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # One scenario's evidence must stay bounded however hard the host is crash-looping, mirroring
+    # BE-0361's own per-capture caps. The newest reports are the ones kept.
+    env, reports = _crashed_runner(monkeypatch, tmp_path)
+    now = env._runner_spawned_at + 1
+    env._discard_runner()
+    for i in range(xcuitest_env_impl._MAX_CRASH_REPORTS + 3):
+        _write_ips(reports, f"xcodebuild-{i}.ips", pid=None, when=now + i)
+    ips = [name for name, _ in env.take_crash_snapshot()() if name.endswith(".ips")]
+    assert len(ips) == xcuitest_env_impl._MAX_CRASH_REPORTS
+    assert ips[0] == f"xcodebuild-{xcuitest_env_impl._MAX_CRASH_REPORTS + 2}.ips"  # newest first
+
+
+def test_a_crash_with_no_report_still_yields_the_runner_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The common shape: the runner's channel stopped answering without the host process faulting, so
+    # macOS wrote nothing. The capture is best-effort per entry, never all-or-nothing — and a host that
+    # has no report store at all (any platform but macOS) lists as empty here, not as a failure.
+    env, reports = _crashed_runner(monkeypatch, tmp_path)
+    log_name = env._runner_log.name if env._runner_log is not None else ""
+    env._discard_runner()
+    assert not reports.exists()
+    assert [name for name, _ in env.take_crash_snapshot()()] == [log_name]
+
+
+def test_a_crash_report_that_cannot_be_read_is_skipped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # An entry the sweep matched but cannot read costs that one report, never the runner log beside it:
+    # this whole capture exists to explain a failure, so it must not become one.
+    env, reports = _crashed_runner(monkeypatch, tmp_path)
+    pid = env._runner_proc.pid if env._runner_proc is not None else 0
+    spawned_at = env._runner_spawned_at
+    env._discard_runner()
+    (reports / "xcodebuild-unreadable.ips").mkdir(parents=True)  # matches the glob, refuses a read
+    _write_ips(reports, "xcodebuild-fine.ips", pid=pid, when=spawned_at + 1)
+    captured = dict(env.take_crash_snapshot()())
+    assert "xcodebuild-fine.ips" in captured
+    assert "xcodebuild-unreadable.ips" not in captured
+
+
+def test_a_crash_whose_capture_is_unreadable_yields_nothing_rather_than_raising(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A spawn that failed before writing a byte leaves no capture to read. A diagnostic must never be
+    # what fails the discard that is already reporting a crash.
+    env, _reports = _crashed_runner(monkeypatch, tmp_path)
+    assert env._runner_log is not None
+    env._runner_log.unlink()
+    env._discard_runner()
+    assert env.take_crash_snapshot()() == []
+
+
+def test_a_cold_spawn_failure_discard_leaves_a_real_crashs_evidence_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # `warn_on_crash=False` takes the same `exited is not None` branch for a failure that is explicitly
+    # not a mid-run crash — the cold-spawn-failure discard. Gating on `exited` rather than on `crashed`
+    # would let such a discard, mid-retry-loop, overwrite the crash evidence with its own.
+    env, _reports = _crashed_runner(monkeypatch, tmp_path)
+    env._discard_runner()
+    crashed = env.take_crash_snapshot()
+    assert crashed()  # the real crash was captured, and this lease now owns it
+    env.start(_sim_eff(test_runner=str(_write_runner(tmp_path))), Preconditions())
+    assert env._runner_proc is not None
+    env._runner_proc.alive = False  # type: ignore[attr-defined]
+    env._discard_runner(warn_on_crash=False, keep_log=True)
+    assert (
+        env.take_crash_snapshot()() == []
+    )  # the cold-spawn failure contributed nothing of its own
+
+
+def test_a_second_crash_on_one_environment_belongs_to_the_next_lease(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Ownership moves at `take_crash_snapshot()`, not at the crash itself, so a second crash on the
+    # same warm environment can never reach the first scenario's evidence: the first lease has already
+    # taken its copy by the time a second scenario gets a chance to lease the device. Not calling
+    # `take_crash_snapshot()` between the two crashes (unlike `test_taking_the_snapshot_moves_it_off_
+    # the_shared_environment`) is the point — it pins that the *cache itself* holds only the second
+    # crash's evidence once the second has happened, regardless of whether anyone read the first.
+    env, _reports = _crashed_runner(monkeypatch, tmp_path)
+    env._discard_runner()
+    env.start(_sim_eff(test_runner=str(_write_runner(tmp_path))), Preconditions())
+    assert env._runner_log is not None
+    env._runner_log.write_text("the second scenario's crash\n", encoding="utf-8")
+    assert env._runner_proc is not None
+    env._runner_proc.alive = False  # type: ignore[attr-defined]
+    env._discard_runner()
+    assert dict(env.take_crash_snapshot()()).popitem()[1] == b"the second scenario's crash\n"
+
+
+def test_an_environment_that_never_crashed_captures_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A healthy teardown is not a crash, so a passing scenario's environment has nothing to hand over
+    # — and every other platform's environment answers the same way by default.
+    _, _, run = _fake_toolchain(monkeypatch)
+    env = XcuitestEnvironment("xcuitest", "UDID", env_run=run)
+    eff = _sim_eff(test_runner=str(_write_runner(tmp_path)))
+    driver = env.start(eff, Preconditions())
+    env.teardown(driver, eff)
+    assert env.take_crash_snapshot()() == []
+
+
+def test_a_report_that_vanishes_mid_listing_is_skipped(tmp_path: Path) -> None:
+    # `DiagnosticReports` is a live directory: `ReportCrash` writes into it while the sweep reads, and a
+    # dangling entry left by a report the system has already rotated away must cost that one entry
+    # rather than the whole lookup.
+    reports = tmp_path / "DiagnosticReports"
+    kept = _write_ips(reports, "xcodebuild-kept.ips", pid=None, when=time.time())
+    (reports / "xcodebuild-gone.ips").symlink_to(reports / "never-existed.ips")
+    assert _reports_since(reports, "xcodebuild-*.ips", 0.0) == [kept]
+
+
+def test_a_crash_with_no_capture_at_all_still_identifies_its_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Capture is on by default, but the field holding it is nullable — a spawn discarded before
+    # `_open_runner_output` ran has none. The two halves are independent, so the report is still found.
+    env, reports = _crashed_runner(monkeypatch, tmp_path)
+    pid = env._runner_proc.pid if env._runner_proc is not None else 0
+    spawned_at = env._runner_spawned_at
+    env._runner_log = None
+    env._snapshot_crash_artifacts()
+    _write_ips(reports, "xcodebuild-only.ips", pid=pid, when=spawned_at + 1)
+    assert [name for name, _ in env.take_crash_snapshot()()] == ["xcodebuild-only.ips"]
+
+
+def test_releasing_a_crashed_lease_captures_before_the_device_goes_back_to_the_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The real path a crashed scenario takes, and the one the whole eager-snapshot argument rests on:
+    # the pipeline's only action on a mid-run crash is to release the lease, which reaches `end_lease`
+    # — not a discard. The discard that would otherwise notice runs at the *next* bring-up, by which
+    # time a concurrent worker's lease can already have respawned over the crashed runner's state, and
+    # a run with no retries left never reaches one at all.
+    env, _reports = _crashed_runner(monkeypatch, tmp_path)
+    eff = _sim_eff(test_runner=str(_write_runner(tmp_path)))
+    log_name = env._runner_log.name if env._runner_log is not None else ""
+    env.end_lease(FakeDriver([]), eff)
+    assert [name for name, _ in env.take_crash_snapshot()()] == [log_name]
+
+
+def test_a_runner_that_lingers_past_its_ended_test_run_is_captured_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The dominant CI shape, and the one a process check alone cannot see: XCTest ends the run and
+    # `xcodebuild` lives on, so `poll()` keeps answering None while `_runner_alive` has already
+    # declared the crash off the capture's own marker. Capturing only the exited case would miss
+    # exactly the failure `docs/ci.md` opens by describing.
+    env, _reports = _crashed_runner(monkeypatch, tmp_path)
+    assert env._runner_proc is not None and env._runner_log is not None
+    env._runner_proc.alive = True  # type: ignore[attr-defined]  # the leader outlives its test run
+    env._runner_log.write_text(
+        "Timed out while requesting screenshot\nTest Suite 'All tests' failed\n", encoding="utf-8"
+    )
+    assert env._runner_alive() is False  # the crash is declared off the marker, not off the process
+    log_name = env._runner_log.name
+    env.end_lease(FakeDriver([]), _sim_eff(test_runner=str(_write_runner(tmp_path))))
+    captured = dict(env.take_crash_snapshot()())
+    assert "Test Suite 'All tests' failed" in captured[log_name].decode()
+
+
+def test_taking_the_snapshot_moves_it_off_the_shared_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The environment outlives the scenario — the pool keeps it warm per device — so evidence left on
+    # it would be readable by, and erasable by, whichever scenario leases the device next. Taking it
+    # moves ownership to the releasing lease: the thunk keeps answering, and a second take (the next
+    # lease's own release, crash or no crash) finds nothing to hand over or to destroy.
+    env, _reports = _crashed_runner(monkeypatch, tmp_path)
+    eff = _sim_eff(test_runner=str(_write_runner(tmp_path)))
+    env.end_lease(FakeDriver([]), eff)
+    first = env.take_crash_snapshot()
+    assert first()  # this lease's own crash, now this lease's to keep
+    env.start(eff, Preconditions())  # the next scenario leases the same warm environment
+    env.end_lease(FakeDriver([]), eff)  # and ends healthy
+    assert env.take_crash_snapshot()() == []  # it inherits nothing
+    assert first()  # and the crashed scenario can still read its own, after that healthy lease
+
+
+def test_the_report_store_is_located_on_demand_and_tolerates_an_unresolvable_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Resolved per lookup rather than at import, because this module loads on every platform — the web
+    # and Android lanes included — and `Path.home()` raises on a container started against a uid with
+    # no passwd entry and no HOME. Evaluating it at import would make that an `import bajutsu` failure
+    # on a host that has no crash-report store to read in the first place.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    assert _diagnostic_reports_dir() == tmp_path / "Library" / "Logs" / "DiagnosticReports"
+
+    def no_home(cls: type[Path]) -> Path:
+        raise RuntimeError("Could not determine home directory")
+
+    monkeypatch.setattr(Path, "home", classmethod(no_home))
+    assert _diagnostic_reports_dir() is None  # reads as "no reports", never as a failure

@@ -367,6 +367,11 @@ iOS 側の対になるジョブ `pool (xcuitest)` は、Simulator を 2 台起�
   高速ゲートのテストは済んでいますが、UIKit と SwiftUI の双方でのオンデバイス確認はこの項目自身のゲートであり、
   [`demos/showcase/BE-0310-screen-transition-verification.ja.md`](../../demos/showcase/BE-0310-screen-transition-verification.ja.md)
   で追っています。
+- `bajutsu run --trace-driver`（BE-0415、既定では無効）: シナリオごとの driver 呼び出しトレースです。Python↔driver
+  の呼び出し（`driver`）と、その内側の各ホスト・デバイス間往復（`transport`。Android のサブプロセスへのフォールバックを含む）を、
+  タイミングとステップ／試行（`attempt`）の帰属つきで、そのシナリオの他の証跡と並べて `driver_trace.json` に書き出します。
+  `--score`/`--zip` と同じく診断専用です。`transport`／`subprocess` の往復の記録は XCUITest と adb だけが対象ですが、
+  フラグ自体はバックエンドで切り替わらないため、web（Playwright）のランでも `driver` 階層のレコードは書き出されます。
 - レポート（`manifest.json` / `junit.xml` / `ctrf.json` / `report.html`）
 - config 解決（defaults × targets、redact マージ）と actuator 選択
 - `simctl` コマンド層、XCUITest のオートメーションスナップショットのパーサ、`doctor` スコア + バックエンド別の実行可能ゲート（`preflight.py`: iOS は必須 CLI + 起動済みシミュレータ、web は Playwright とその Chromium ブラウザ）

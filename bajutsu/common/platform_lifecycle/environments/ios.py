@@ -103,6 +103,13 @@ class _DeviceEnvironment:
         # brings no device up, so the leased udid is always the one it ran on.
         return None
 
+    def take_crash_snapshot(self) -> Callable[[], list[tuple[str, bytes]]]:
+        # Only the XCUITest Simulator lifecycle owns a runner process that can crash and leave
+        # evidence behind (it overrides this); fake spawns none, and the live WebDriver route drives a
+        # device whose automation process it does not own. A real, callable no-op thunk rather than a
+        # null, the same shape `bridge_collector` above already returns (BE-0421).
+        return list
+
     def end_lease(self, driver: base.Driver, eff: Effective) -> None:
         # No warm resident here, so a lease's end is just its full teardown (BE-0291).
         self.teardown(driver, eff)

@@ -182,6 +182,29 @@ class RunEnvironment(Protocol):
         each keeps the strongest retry it has today and the pipeline needs no per-platform branch.
         """
 
+    def take_crash_snapshot(self) -> Callable[[], list[tuple[str, bytes]]]:
+        """Hand the releasing lease the crash evidence this environment captured, and forget it.
+
+        Called by the pool once, as the lease releases, and the returned thunk is what the run
+        pipeline reads at a crash-exhausted `RunResult` — so a scenario that recovered within its
+        retry budget never asks. Each pair the thunk yields is an artifact name and its bytes,
+        written into that scenario's own evidence directory under `crash-diagnostics/` (BE-0421):
+        the environment holds the only handles that name the crashed runner, and the pipeline holds
+        the only writer that can cross the redaction boundary.
+
+        Ownership *moves*, which is the whole point of returning a thunk rather than the bytes. The
+        capture happens where the crash is observed, because the crashed lease is back in the pool
+        before the retry loop gives up; but the environment then outlives the scenario — the pool
+        keeps it warm per device — so evidence left behind here would be readable, and erasable, by
+        whichever scenario leases the device next. Taking it at release makes it lease-local, the
+        same rule `video_start_stalled` follows for exactly the same `workers > 1` reason. The thunk
+        may still defer work of its own; what it must not do is read state a later lease can change.
+
+        Default: a thunk answering `[]`. Every platform but the Simulator XCUITest backend captures
+        nothing for a crash, so the pipeline's write step is an empty iteration and needs no
+        per-platform branch.
+        """
+
     def replaced_device(self) -> str | None:
         """The device this environment moved to when `start` replaced a vanished one, else None.
 

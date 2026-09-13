@@ -18,7 +18,8 @@ from bajutsu.common.drivers import base, tracing
 from bajutsu.common.drivers.fake import FakeDriver
 from bajutsu.common.evidence import NullSink
 from bajutsu.common.evidence.network import NetworkExchange, ScreenTransition
-from bajutsu.common.orchestrator import RunResult, sanitize_source_stem
+from bajutsu.common.orchestrator import RunResult, sanitize_source_stem, scenario_slug
+from bajutsu.common.orchestrator.types._functions import _MAX_SLUG_CHARS
 from bajutsu.common.report.format import video_seconds
 from bajutsu.common.runner import Lease, run_all, run_and_report, run_matrix_and_report
 from bajutsu.common.scenario import Scenario
@@ -1419,6 +1420,93 @@ def test_sanitize_source_stem_replaces_only_the_unsafe_characters() -> None:
     assert sanitize_source_stem("a??b") == "a__b"  # one replacement per unsafe character
 
 
+# --- the shared slug length cap (BE-0420) ---
+
+# The kind of name `record` auto-generates with no `--out`: the recording's whole goal, verbatim.
+_LONG_GOAL = (
+    "log in with a saved card, confirm the checkout total matches the cart, "
+    "and check the confirmation email arrives"
+)
+
+
+def test_scenario_slug_caps_an_overlong_name_without_a_trailing_hyphen() -> None:
+    slug = scenario_slug(_LONG_GOAL)
+    assert len(slug) <= _MAX_SLUG_CHARS
+    assert slug == "log-in-with-a-saved-card-confirm-the-checkout-total-matches"
+    assert not slug.endswith("-")
+
+
+def test_scenario_slug_drops_a_hyphen_the_cut_leaves_dangling() -> None:
+    # 59 alphanumerics then a separator: the character slice lands exactly on the hyphen.
+    assert scenario_slug("a" * 59 + " tail") == "a" * 59
+
+
+def test_sanitize_source_stem_caps_an_overlong_ascii_stem() -> None:
+    stem = "checkout_" * 20
+    capped = sanitize_source_stem(stem)
+    assert len(capped) == _MAX_SLUG_CHARS
+    assert capped == stem[:_MAX_SLUG_CHARS]
+
+
+def test_sanitize_source_stem_caps_a_multibyte_stem_by_character_count_not_bytes() -> None:
+    """An overlong Japanese stem is capped by character count, not by its UTF-8 byte length (BE-0420).
+
+    `決済フロー` is 3 bytes per character, so a byte-oriented cap would give this stem far fewer
+    characters than an equally long ASCII one. This pins that the cap does not do that.
+    """
+    capped = sanitize_source_stem("ab" + "決済フロー" * 12)
+    assert len(capped) == _MAX_SLUG_CHARS
+    assert len(capped.encode("utf-8")) > _MAX_SLUG_CHARS
+    assert capped == "ab" + "決済フロー" * 11 + "決済フ"
+
+
+def test_sanitize_source_stem_never_returns_empty_for_a_non_empty_stem() -> None:
+    """A non-empty stem always keeps at least its first character (BE-0420).
+
+    A character-count cap makes this trivially true for any budget of at least one, unlike a
+    byte-oriented cap, which could drop a multi-byte character's every byte. Kept as a regression
+    guard on the no-fallback claim in `sanitize_source_stem`'s docstring.
+    """
+    assert sanitize_source_stem("決") == "決"
+    assert sanitize_source_stem("決済フロー" * 10)
+
+
+def test_recorded_scenario_with_no_out_flag_yields_a_sid_within_the_cap() -> None:
+    """The `record`-with-no-`--out` path: a verbose goal becomes a file name, then an evidence dir.
+
+    `scenario_out_name` itself stays uncapped (the item's *Not doing*) — a long `*.yaml` name is
+    legible on disk and blocks nothing; what must stay bounded is the directory every later run of
+    that file creates.
+    """
+    from bajutsu.common.runner.pipeline import _evidence_sid
+    from bajutsu.serve.helpers import scenario_out_name
+
+    scenario = Scenario.model_validate({"name": _LONG_GOAL, "steps": [{"tap": {"id": "ok"}}]})
+    scenario.set_source_stem(Path(scenario_out_name(_LONG_GOAL)).stem)
+
+    sid = _evidence_sid(0, scenario)
+    assert len(sid) <= len("00-") + _MAX_SLUG_CHARS
+    assert sid == "00-log_in_with_a_saved_card__confirm_the_checkout_total_matches"
+
+
+def test_slugs_colliding_after_truncation_still_get_distinct_sids() -> None:
+    """Truncation adds no collision the run-order prefix does not already resolve (BE-0420).
+
+    Why the item adds no duplicate-suffix counter: every `sid` `_evidence_sid` builds carries the
+    `{i:02d}-` index, which is what keeps two scenarios apart within a run — capped slug or not.
+    """
+    from bajutsu.common.runner.pipeline import _evidence_sid
+
+    shared = "checkout_" * 20
+    first = Scenario.model_validate({"name": "a", "steps": [{"tap": {"id": "ok"}}]})
+    second = Scenario.model_validate({"name": "b", "steps": [{"tap": {"id": "ok"}}]})
+    first.set_source_stem(shared + "_one")
+    second.set_source_stem(shared + "_two")
+
+    assert sanitize_source_stem(shared + "_one") == sanitize_source_stem(shared + "_two")
+    assert _evidence_sid(0, first) != _evidence_sid(1, second)
+
+
 def test_scenario_runner_sid_prefers_source_stem_over_name_and_sanitizes_it() -> None:
     """`run_one`'s `sid` uses the source file's stem, not `name:`, sanitized through the real call (BE-0417).
 
@@ -2428,3 +2516,134 @@ def test_trace_driver_write_failure_is_warned_about_not_raised(
     results = run_all(_eff(), [scenario], _lease, run_dir=run_dir, trace_driver=True)
     assert results[0].ok, results[0].failure
     assert not (run_dir / results[0].sid / "driver_trace.json").exists()
+
+
+# --- the failed scenario's own copy of the backend's crash evidence (BE-0421) --- #
+#
+# A scenario whose crash-recovery retries all exhausted used to report only that the backend died. The
+# environment behind the crashed lease holds the runner's captured output and, on a genuine process
+# fault, the host crash report; the pipeline copies both into that scenario's evidence directory and
+# points the failure string at them. It asks exactly once, where the retry loop has given up.
+
+_CRASH_EVIDENCE = [("runner.log", b"the runner's last words\n"), ("xcodebuild.ips", b'{"pid":1}')]
+
+
+def _crash_evidence_lease(*, crashes: int) -> Callable[[Effective, Scenario], Lease]:
+    """A lease factory whose first `crashes` attempts crash, each carrying the same crash evidence."""
+    state = {"n": 0}
+
+    def lease(eff: Effective, scenario: Scenario) -> Lease:
+        state["n"] += 1
+        return Lease(
+            driver=_crashing_driver() if state["n"] <= crashes else _fake_driver(),
+            sink=NullSink(),
+            relaunch=None,
+            control=None,
+            collector=None,
+            release=lambda: None,
+            crash_artifacts=lambda: list(_CRASH_EVIDENCE),
+        )
+
+    return lease
+
+
+def test_a_crash_exhausted_scenario_keeps_the_backends_own_crash_evidence(tmp_path: Path) -> None:
+    # The observable outcome BE-0421 exists for: the evidence lands beside the screenshots and element
+    # trees the same run already produced, and the failure string names the directory, so a contributor
+    # reading why the scenario failed never has to already know it is there.
+    run_dir = tmp_path / "runs" / "run1"
+    scenarios = [Scenario.model_validate({"name": "a", "steps": [{"tap": {"id": "ok"}}]})]
+    results = run_all(
+        _eff(), scenarios, _crash_evidence_lease(crashes=2), crash_retries=1, run_dir=run_dir
+    )
+    directory = run_dir / "00-a" / "crash-diagnostics"
+    assert (directory / "runner.log").read_text(encoding="utf-8") == "the runner's last words\n"
+    assert (directory / "xcodebuild.ips").exists()
+    assert str(directory) in (results[0].failure or "")
+
+
+def test_a_recovered_scenario_keeps_no_crash_evidence(tmp_path: Path) -> None:
+    # A scenario that recovers within its retry budget passes, and a passing scenario needs no crash
+    # report — copying after each attempt would leave it carrying evidence for a failure its own final
+    # result no longer reports.
+    run_dir = tmp_path / "runs" / "run1"
+    scenarios = [Scenario.model_validate({"name": "a", "steps": [{"tap": {"id": "ok"}}]})]
+    results = run_all(
+        _eff(), scenarios, _crash_evidence_lease(crashes=1), crash_retries=1, run_dir=run_dir
+    )
+    assert results[0].ok
+    assert not (run_dir / "00-a" / "crash-diagnostics").exists()
+
+
+def test_a_backend_that_captures_nothing_leaves_the_failure_untouched(tmp_path: Path) -> None:
+    # Android, the web backend, and the fake one all return `[]`, so the write step is an empty
+    # iteration and the failure string says exactly what it said before this feature existed.
+    run_dir = tmp_path / "runs" / "run1"
+    scenarios = [Scenario.model_validate({"name": "a", "steps": [{"tap": {"id": "ok"}}]})]
+
+    def lease(eff: Effective, scenario: Scenario) -> Lease:
+        return Lease(
+            driver=_crashing_driver(),
+            sink=NullSink(),
+            relaunch=None,
+            control=None,
+            collector=None,
+            release=lambda: None,
+        )
+
+    results = run_all(_eff(), scenarios, lease, crash_retries=0, run_dir=run_dir)
+    assert not (run_dir / "00-a" / "crash-diagnostics").exists()
+    failure = results[0].failure or ""
+    assert "crashed mid-run" in failure and "crash-diagnostics" not in failure
+
+
+def test_a_failed_crash_evidence_write_does_not_displace_the_scenarios_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A diagnostic artifact must never turn an already-decided failure into a different, unrelated one:
+    # a full disk or a permissions error is warned about, and the scenario still fails for the crash it
+    # actually failed for.
+    from bajutsu.common.evidence.sink import RunArtifactWriter
+
+    def refuse(self: RunArtifactWriter, name: str, text: str) -> Path:
+        raise OSError("no space left on device (test)")
+
+    monkeypatch.setattr(RunArtifactWriter, "write_text", refuse)
+    run_dir = tmp_path / "runs" / "run1"
+    scenarios = [Scenario.model_validate({"name": "a", "steps": [{"tap": {"id": "ok"}}]})]
+    with caplog.at_level("WARNING"):
+        results = run_all(
+            _eff(), scenarios, _crash_evidence_lease(crashes=1), crash_retries=0, run_dir=run_dir
+        )
+    failure = results[0].failure or ""
+    assert "crashed mid-run" in failure and "crash-diagnostics" not in failure
+    assert "writing the crash artifact runner.log failed" in caplog.text
+
+
+def test_a_lease_time_crash_keeps_the_earlier_attempts_crash_evidence(tmp_path: Path) -> None:
+    # `lz` is reset to None at the top of every attempt, so a loop whose last attempt crashed during
+    # bring-up — before there was a lease to hold — would otherwise drop the evidence an earlier
+    # attempt's environment is still holding for the very crash this scenario failed for.
+    run_dir = tmp_path / "runs" / "run1"
+    state = {"n": 0}
+
+    def lease(eff: Effective, scenario: Scenario) -> Lease:
+        state["n"] += 1
+        if state["n"] > 1:
+            raise base.BackendCrashError("runner crashed during the readiness gate (test)")
+        return Lease(
+            driver=_crashing_driver(),
+            sink=NullSink(),
+            relaunch=None,
+            control=None,
+            collector=None,
+            release=lambda: None,
+            crash_artifacts=lambda: list(_CRASH_EVIDENCE),
+        )
+
+    scenarios = [Scenario.model_validate({"name": "a", "steps": [{"tap": {"id": "ok"}}]})]
+    results = run_all(_eff(), scenarios, lease, crash_retries=1, run_dir=run_dir)
+    assert not results[0].ok
+    directory = run_dir / "00-a" / "crash-diagnostics"
+    assert (directory / "runner.log").exists()
+    assert str(directory) in (results[0].failure or "")

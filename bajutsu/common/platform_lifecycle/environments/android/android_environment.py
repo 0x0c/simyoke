@@ -385,6 +385,12 @@ class AndroidEnvironment:
         # creates one to replace it.
         return None
 
+    def take_crash_snapshot(self) -> Callable[[], list[tuple[str, bytes]]]:
+        # This backend spawns no host-side resident whose output it captures: the UI Automator server
+        # runs on the device and its failures reach the driver directly, so there is no host log or
+        # crash report of its own to copy into the scenario's directory (BE-0421).
+        return list
+
     def end_lease(self, driver: base.Driver, eff: Effective) -> None:
         self.teardown(driver, eff)  # no warm resident kept: a lease's end is its full teardown
 

@@ -58,6 +58,15 @@ def test_every_environment_satisfies_both_lease_surfaces() -> None:
         assert isinstance(env, Environment)
 
 
+def test_only_the_xcuitest_simulator_backend_captures_anything_for_a_crash() -> None:
+    # BE-0421: the pipeline copies a crashed backend's own evidence into the failed scenario's
+    # directory without branching on the platform, which holds only because every environment answers.
+    # A fresh environment has nothing to hand over — the capture happens where a crash is observed —
+    # and on every platform but the Simulator XCUITest backend that stays true for the whole run.
+    for actuator in ("xcuitest", "playwright", "fake", "adb"):
+        assert environment_for(actuator, "UDID").take_crash_snapshot()() == []
+
+
 def test_captures_video_is_true_for_the_simctl_backed_devices() -> None:
     # The `record` bug BE-0256 fixes: the simctl-backed iOS device (xcuitest) can record a
     # scenario-wide video, so `captures_video` reads it from the Environment seam rather than a

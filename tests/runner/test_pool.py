@@ -539,6 +539,7 @@ class _RecordingEnv:
         self.end_lease_error = end_lease_error
         # How many times the crash retry asked this env to swap its device (BE-0354).
         self.replacement_requests = 0
+        self.snapshots_taken = 0
         # `bridge_collector`'s returned teardown raising mimics `adb reverse --remove` on a device
         # that already dropped off the bus (BE-0342).
         self.fail_bridge_teardown = fail_bridge_teardown
@@ -609,6 +610,12 @@ class _RecordingEnv:
         # The udid this env moved to when `start` had to replace a vanished device. Settable
         # per instance so a test can drive the pool's re-keying without a Simulator.
         return self.replacement
+
+    def take_crash_snapshot(self) -> Callable[[], list[tuple[str, bytes]]]:
+        # Named after the udid, so a test can tell which environment's capture the lease reached, and
+        # counted so a test can pin that the pool takes it exactly once, at release.
+        self.snapshots_taken += 1
+        return lambda: [(f"runner-{self.udid}.log", b"crashed")]
 
     def end_lease(self, driver: base.Driver, eff: Effective) -> None:
         if self.end_lease_error is not None:
@@ -2176,6 +2183,12 @@ def test_device_pool_hands_the_lease_its_environments_replacement_request(
         assert created[-1].replacement_requests == 1
         # Nothing recorded a video, so the stall signal is a first-class False rather than unknown.
         assert lz.video_start_stalled() is False
+        # The crash capture is read back after release through the same environment, and for the same
+        # reason: the crash it holds belongs to this device (BE-0421).
+        assert lz.crash_artifacts() == [("runner-UDID-A.log", b"crashed")]
+        # Taken off the environment once, as the lease released — not read off it on demand, which
+        # under `workers > 1` would cross this scenario's crash with the next lease's (BE-0421).
+        assert created[-1].snapshots_taken == 1
     finally:
         shutdown()
 

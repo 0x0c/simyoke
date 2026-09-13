@@ -35,6 +35,11 @@ def _never_stalled() -> bool:
     return False
 
 
+def _no_crash_artifacts() -> list[tuple[str, bytes]]:
+    """The neutral crash capture: a lease whose platform captures nothing for a crash (BE-0421)."""
+    return []
+
+
 @dataclass
 class Lease:
     """A leased device for one scenario run.
@@ -75,6 +80,11 @@ class Lease:
     # symptom of the wedged capture pipeline, and advisory only: it selects the crash retry's recovery
     # rung and never fails an attempt on its own. Always False where no video was recorded.
     video_start_stalled: Callable[[], bool] = _never_stalled
+    # The files this lease's environment captured for a backend crash it could not recover from
+    # (BE-0421), as `(artifact name, bytes)` pairs. Read once, after the crash retry loop has given up,
+    # and written into the failed scenario's own evidence directory — so a scenario that recovered
+    # never asks, and a platform that captures nothing returns `[]` and leaves the write a no-op.
+    crash_artifacts: Callable[[], list[tuple[str, bytes]]] = _no_crash_artifacts
 
 
 # Leases a free device for one scenario (blocking until one frees up): launches the app

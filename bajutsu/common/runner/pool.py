@@ -43,7 +43,7 @@ from bajutsu.common.platform_lifecycle import (
 from bajutsu.common.report import git_revision, run_provenance
 from bajutsu.common.runner.launch import launch_driver
 from bajutsu.common.runner.recovery import guarded_teardown
-from bajutsu.common.runner.types import Lease, LeaseFn
+from bajutsu.common.runner.types import Lease, LeaseFn, _no_crash_artifacts
 from bajutsu.common.scenario import Scenario, dump_scenario_file, redact_totp_secrets
 
 __all__ = ["device_control", "device_pool", "device_relauncher"]
@@ -478,7 +478,14 @@ def device_pool(  # noqa: C901, PLR0915
             relaunch: RelaunchFn = lease_env.relauncher(eff, scenario, driver, extra_env=extra_env)
             control: DeviceControl | None = lease_env.controller(eff)
 
+            # This lease's own copy of whatever crash evidence its environment captured, taken off that
+            # environment at the end of `release()` below (BE-0421). Lease-local for the reason
+            # `video_start_stalled` is: the environment is kept warm per device, so evidence left on it
+            # would be readable — and clearable — by whichever scenario leases the device next.
+            crash_evidence: Callable[[], list[tuple[str, bytes]]] = _no_crash_artifacts
+
             def release() -> None:
+                nonlocal crash_evidence
                 # Runs from `run_one`'s `finally`, so a teardown hiccup anywhere below (an
                 # already-gone tunnel, socket, app, or device) must not replace the scenario's own
                 # result or skip `free.put(udid)` — the same reasoning as the actuator switch above
@@ -534,6 +541,22 @@ def device_pool(  # noqa: C901, PLR0915
                         mid_run=True,
                         what=f"discarding the runner on {udid} after a failed end-of-lease teardown",
                     )
+
+                def _take_crash_snapshot() -> None:
+                    nonlocal crash_evidence
+                    crash_evidence = lease_env.take_crash_snapshot()
+
+                # After every teardown above, because those are what let the environment observe a
+                # crashed runner, and before `free.put` hands the device to the next lease (BE-0421).
+                # Guarded like every other site here, even though today's implementation cannot raise:
+                # this call sits ahead of `free.put`, so a hiccup in a future implementation that does
+                # real work here (the protocol explicitly allows it) must not skip it and strand the
+                # device on the next lease's `free.get()`.
+                guarded_teardown(
+                    _take_crash_snapshot,
+                    mid_run=True,
+                    what=f"capturing the crash snapshot on {udid} at the lease's end",
+                )
                 free.put(udid)
 
             meta = catalog.get(udid, {})
@@ -555,6 +578,11 @@ def device_pool(  # noqa: C901, PLR0915
                 # this pool holds onto the device it created (BE-0354).
                 request_device_replacement=lease_env.request_device_replacement,
                 video_start_stalled=lambda: video_start_stalled,
+                # Read after release, like the two above, but out of this lease's own copy rather than
+                # off the shared environment — `release()` moved it there (BE-0421).
+                # The lambda is load-bearing: `crash_evidence` is rebound by `release()`, so binding
+                # the name directly would freeze this lease on the no-op it starts at.
+                crash_artifacts=lambda: crash_evidence(),  # noqa: PLW0108
             )
         except BaseException:
             # A failed launch must not leak the collector tunnel (BE-0283) or the collector itself —

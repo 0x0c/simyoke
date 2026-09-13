@@ -117,6 +117,11 @@ class WebEnvironment:
     def replaced_device(self) -> str | None:
         return None  # no device behind a browser lane, so none can vanish and be replaced
 
+    def take_crash_snapshot(self) -> Callable[[], list[tuple[str, bytes]]]:
+        # Playwright owns the browser process and surfaces its own failure through the driver, so
+        # there is no separately captured runner output or host crash report to copy (BE-0421).
+        return list
+
     def end_lease(self, driver: base.Driver, eff: Effective) -> None:
         self.teardown(driver, eff)  # no warm resident: a lease's end is its full teardown
 

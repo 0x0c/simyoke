@@ -136,7 +136,9 @@ Both lanes answer that question the same way, in three layers split by what each
 `bajutsu`, because the running process is the one thing that knows *when* a stall happens; from CI
 about the device, which only something holding that device can read; and over time about the host,
 which only a sampler running alongside the job can record. Every artifact lands under
-`runs/diagnostics/`, which the jobs already upload. None of it reaches a verdict: the collection
+`runs/diagnostics/`, which the jobs already upload — with one exception, the per-scenario crash
+evidence below, which lands in the failing scenario's own evidence directory instead, because it
+belongs to that one scenario rather than to the job. None of it reaches a verdict: the collection
 writes files and nothing else, and the deterministic assertions still decide pass/fail.
 
 One environment variable arms the first layer on both backends. `BAJUTSU_STALL_DIAGNOSTICS` names
@@ -169,6 +171,21 @@ there.
   `recordVideo` produces no bytes, writing a timed `simctl` screenshot, `sample` output for the
   rendering processes, and a `ps` / `vm_stat` snapshot into
   `runs/diagnostics/stalls/stall-NN-<reason>-<pid>/`.
+- **Inside `bajutsu`, per failing scenario, with nothing to opt into** (BE-0421). A scenario whose
+  crash-recovery retries all exhausted gets a `crash-diagnostics/` subdirectory in its *own*
+  evidence directory, `runs/<run_id>/<sid>/`, holding the tail of the crashed runner's captured
+  output — far more of it than the twenty lines the crash warning folds in, but still bounded — and,
+  whenever macOS wrote one for the faulted `xcodebuild` process, its `.ips` crash report; the
+  scenario's failure string names that directory, so nobody has to already know it exists. This is
+  the local-run and per-scenario counterpart to the sweep below: that one tars up the whole job's
+  report store, which cannot say which crash belongs to which of a dozen scenarios, and runs in CI
+  only — a developer reproducing the crash with a local `bajutsu run` got nothing from it at all.
+  Both halves are best-effort: a report `ReportCrash` never wrote, or a `DiagnosticReports`
+  directory this host does not have, leaves that entry out rather than failing anything. The runner
+  output is collected for the two crash shapes the runner's own liveness signals name — `xcodebuild`
+  exited, or it lingers past a test run its capture says has ended. A channel that simply stopped
+  answering while the process runs on and writes no such marker is the wedged-Simulator shape
+  BE-0354 escalates instead, and this directory stays empty for it.
 - **From CI, about the Simulator and CoreSimulator**, through the
   [`collect-ios-diagnostics`](../.github/actions/collect-ios-diagnostics/action.yml) composite action
   every Simulator-driving job calls. Its cheap tier runs on every job: the tail of
