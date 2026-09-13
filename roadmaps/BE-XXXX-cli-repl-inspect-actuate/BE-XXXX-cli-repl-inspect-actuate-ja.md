@@ -23,8 +23,8 @@
 は大規模言語モデル(LLM)に何も尋ねず、シナリオも書き出しません。`repl`は、`query()`と、各
 [バックエンド](../../docs/ja/glossary.md#driver-backend-actuator-platform)がすでに実装している
 操作メソッドを呼び出すだけの、薄いループにすぎません。そのため、XCUITest・adb・Playwrightは、
-読み取りと操作についてはバックエンド固有のコードなしにこのシェルを手に入れます(終了時の経路だけ
-は、Web専用の分岐を1つ持ちます。詳細設計を参照)。
+読み取りと操作についてはバックエンド固有のコードなしにこのシェルを手に入れます(起動と終了の経路
+だけは、この共通部分を超える分岐を持ちます。詳細設計を参照)。
 
 ## 動機
 
@@ -63,7 +63,13 @@ Authorビューは、これより近いところまで来ています。`/api/ca
 `_load_effective_with_source`と`_select_actuator_or_exit`(`bajutsu/cli/_shared.py`)を再利用
 します。デバイスの起動は、`record`と`crawl`が使っているのと同じ`launch_driver`
 (`bajutsu/common/runner/launch.py`)を再利用し、`udid`の解決(`playwright`アクチュエータでは省略)
-とデバイスの起動を済ませてからドライバを渡します。`--headed`/`--no-headed`と`--browser`はWebバック
+とデバイスの起動を済ませてからドライバを渡します。この起動より前に、`repl`は設定で`launchServer`
+が宣言されている場合、`run`・`record`・`crawl`・`audit`がすでに共有している
+`_start_launch_server_or_exit`ヘルパー(`bajutsu/cli/_shared.py`)を通じて、ターゲット自身のサーバ
+を起動します。停止は、`record`や`crawl`と同じく`atexit`で行います。この手順がなければ、
+`baseUrl`を`launchServer`から供給するWebターゲットでは、ブラウザは何も待ち受けていないホストを
+開いてしまい、`tree`はどれもエラーページの要素を読むことになります。`--headed`/`--no-headed`と
+`--browser`はWebバック
 エンド専用で、`record`・`crawl`・`run`が共有する`_with_headed`と、`record`・`run`が使う
 `_resolve_browser`(`bajutsu/cli/_shared.py`)を再利用します(`crawl`に`--browser`はありません)。
 この2つは、このシェルにとって特に重要です。headlessな
@@ -81,7 +87,7 @@ v1のコマンドは、id中心の小さな集合にとどめます。
 | `back` | `driver.back()`を呼びます |
 | `screenshot [path]` | `driver.screenshot(path)`を呼びます。`path`省略時は自動で名前を付けます |
 | `help` | 上記のコマンド一覧を表示します |
-| `exit` / `quit` | シェルを終了します。デバイス側のアプリ(xcuitest・adb)はそのまま起動状態を保ちますが、Webバックエンドのブラウザは、repl自身がそのプロセスを所有しているため、Webのライフサイクルフック(`cast(base.BackendLifecycle, driver).close()`。`WebEnvironment.teardown`が呼ぶのと同じ呼び出しで、`Driver`自体は`close()`を宣言していません)で終了します |
+| `exit` / `quit` | シェルを終了します。ローカルなSimulator・デバイス側のアプリ(`xcuitest`・`adb`)はそのまま起動状態を保ちますが、このプロセス自身が所有するセッションは、対応する`Environment.teardown`と同じ呼び出しで終了します。Webバックエンドのブラウザは`cast(base.BackendLifecycle, driver).close()`(`WebEnvironment.teardown`と同じ呼び出しで、`Driver`自体は`close()`を宣言していません)、`--udid https://…`のライブ経路では`XcuitestLiveEnvironment.teardown`が削除するWebDriverセッション(放置すればグリッド上に予約されたまま期限切れまで残ります)です |
 
 ツリーを読む操作、あるいはツリーに対して解決するすべてのコマンドは、`run`の各ハンドラと同じ
 やり方で、アクチュエーション用の読み取りを求めます。ドライバが実装していれば
@@ -167,9 +173,12 @@ v1ではそこまで届きません。ツリーに要素そのものが現れな
 > ともに記録します。
 
 - [ ] 新しい`bajutsu/repl/`パッケージでの`bajutsu repl`コマンドの土台。
-  `_load_effective_with_source`・`_select_actuator_or_exit`・`launch_driver`の再利用、
+  `_load_effective_with_source`・`_select_actuator_or_exit`・`_start_launch_server_or_exit`・
+  `launch_driver`の再利用(launchサーバは`atexit`で停止)、
   `--headed`・`--no-headed`・`--browser`、`bajutsu>`プロンプトのループ、`help`・`exit`・`quit`
-  (終了時のWeb限定`cast(base.BackendLifecycle, driver).close()`を含みます)。
+  (終了時のWebバックエンドの`cast(base.BackendLifecycle, driver).close()`と、
+  `--udid https://…`のライブ経路での`XcuitestLiveEnvironment.teardown`によるWebDriverセッション
+  終了を含みます)。
 - [ ] `tree`・`tree --json`・`find <substring>`。`settled_query()`・`query()`とread-lagバリアの
   経路を再利用します。
 - [ ] `tap <id>`・`type <id> <text>`。`run`と同じ形で`ElementNotFound`・`AmbiguousSelector`・
@@ -191,6 +200,8 @@ v1ではそこまで届きません。ツリーに要素そのものが現れな
   `bajutsu/common/scenario/models/selector.py`
 - `SettledReadProvider` — `bajutsu/common/drivers/base/settled_read_provider.py`
 - `BackendLifecycle` — `bajutsu/common/drivers/base/backend_lifecycle.py`
+- `_start_launch_server_or_exit` — `bajutsu/cli/_shared.py`
+- `XcuitestLiveEnvironment` — `bajutsu/common/platform_lifecycle/environments/xcuitest_live.py`
 - `record`と`crawl` — `repl`が隣に位置する、既存の2つのTier 1オーサリング経路(`docs/cli.md`)
 - [BE-0332 — read-lagバリア](../../roadmaps/BE-0332-read-lag-barrier/BE-0332-read-lag-barrier-ja.md)
 - [BE-0262 — Author エディタにライブなステップ選択と target 単位に絞った run を導入する](../../roadmaps/BE-0262-serve-author-live-step-picker/BE-0262-serve-author-live-step-picker-ja.md)

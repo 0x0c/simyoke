@@ -26,7 +26,8 @@ already use. Unlike `record` and `crawl`, `repl` asks no large language model (L
 writes no scenario. `repl` is a thin loop over `query()` and the actuation methods every
 [backend](../../docs/glossary.md#driver-backend-actuator-platform) already implements, so
 XCUITest, adb, and Playwright gain the shell for free with no per-backend read or actuation
-code — only the exit path carries one web-only branch (see *Detailed design*).
+code — only the launch and exit paths carry branches beyond that shared surface (see *Detailed
+design*).
 
 ## Motivation
 
@@ -66,6 +67,11 @@ resolution and backend selection reuse the same shared CLI helpers `record` alre
 (`bajutsu/cli/_shared.py`) — and device bring-up reuses `launch_driver`
 (`bajutsu/common/runner/launch.py`), the same combination `record` and `crawl` use to resolve a
 `udid` (skipped for the `playwright` actuator) and boot the device before handing off a driver.
+Ahead of that launch, `repl` brings the target's own server up where the config declares
+`launchServer`, through the `_start_launch_server_or_exit` helper (`bajutsu/cli/_shared.py`) that
+`run`, `record`, `crawl`, and `audit` already share, and stops it on exit through `atexit` the way
+`record` and `crawl` do. Without that step a web target serving its `baseUrl` from `launchServer`
+opens the browser on a host that is not listening, and every `tree` reads the error page.
 `--headed`/`--no-headed` and `--browser` are web-only, reusing the shared `_with_headed` helper
 `record`, `crawl`, and `run` already call and the `_resolve_browser` helper `record` and `run`
 call (`bajutsu/cli/_shared.py`) — `crawl` exposes no `--browser` — and matter for this shell in
@@ -84,7 +90,7 @@ The v1 command set stays small and id-first:
 | `back` | `driver.back()` |
 | `screenshot [path]` | `driver.screenshot(path)`, auto-named when `path` is omitted |
 | `help` | list the commands above |
-| `exit` / `quit` | leave the shell; a device-backed app (xcuitest / adb) keeps running, while the web backend's browser is closed through the web lifecycle hook (`cast(base.BackendLifecycle, driver).close()`, the same call `WebEnvironment.teardown` makes — `Driver` itself declares no `close()`) because the repl process owns it |
+| `exit` / `quit` | leave the shell; a Simulator- or device-backed app (local `xcuitest`, `adb`) keeps running, while any session this process itself owns is closed through the same call its `Environment.teardown` makes — the web backend's browser (`cast(base.BackendLifecycle, driver).close()`, as `WebEnvironment.teardown` does; `Driver` itself declares no `close()`) and, on the `--udid https://…` live route, the WebDriver session `XcuitestLiveEnvironment.teardown` deletes, which would otherwise stay reserved on the grid until it expires |
 
 Every command that reads or resolves against the tree asks for an actuation-grade read the same
 way `run`'s own handlers do: through `SettledReadProvider.settled_query()`
@@ -166,9 +172,12 @@ own handlers are tested, so the new module clears the per-file coverage floor
 > (oldest first), linking the PRs.
 
 - [ ] `bajutsu repl` command scaffold under the new `bajutsu/repl/` package:
-  `_load_effective_with_source` / `_select_actuator_or_exit` / `launch_driver` reuse,
+  `_load_effective_with_source` / `_select_actuator_or_exit` / `_start_launch_server_or_exit` /
+  `launch_driver` reuse (with the launch server stopped on exit via `atexit`),
   `--headed`/`--no-headed`/`--browser`, the `bajutsu>` prompt loop, `help` / `exit` / `quit`
-  (including the web-only `cast(base.BackendLifecycle, driver).close()` on exit).
+  (including `cast(base.BackendLifecycle, driver).close()` on the web backend's exit and
+  `XcuitestLiveEnvironment.teardown`'s WebDriver-session close on the `--udid https://…` live
+  route).
 - [ ] `tree` / `tree --json` / `find <substring>`, reusing `settled_query()` / `query()` and the
   read-lag-barrier path.
 - [ ] `tap <id>` / `type <id> <text>`, surfacing `ElementNotFound` / `AmbiguousSelector` /
@@ -188,6 +197,8 @@ own handlers are tested, so the new module clears the per-file coverage floor
 - [`Selector`](../../docs/glossary.md#scenario-authoring) — `bajutsu/common/scenario/models/selector.py`
 - `SettledReadProvider` — `bajutsu/common/drivers/base/settled_read_provider.py`
 - `BackendLifecycle` — `bajutsu/common/drivers/base/backend_lifecycle.py`
+- `_start_launch_server_or_exit` — `bajutsu/cli/_shared.py`
+- `XcuitestLiveEnvironment` — `bajutsu/common/platform_lifecycle/environments/xcuitest_live.py`
 - `record` and `crawl` — the two existing Tier 1 authoring paths `repl` sits beside (`docs/cli.md`)
 - [BE-0332 — read-lag barrier](../../roadmaps/BE-0332-read-lag-barrier/BE-0332-read-lag-barrier.md)
 - [BE-0262 — live step-picking and target-scoped runs in the Author editor](../../roadmaps/BE-0262-serve-author-live-step-picker/BE-0262-serve-author-live-step-picker.md)
