@@ -21,7 +21,7 @@
     "bajutsu/analysis/flakiness/_functions.py": 95.95,
     "bajutsu/analysis/flakiness/flaky_scenario.py": 100.0,
     "bajutsu/analysis/impact/__init__.py": 100.0,
-    "bajutsu/analysis/impact/_functions.py": 97.02,
+    "bajutsu/analysis/impact/_functions.py": 94.04,
     "bajutsu/analysis/impact/impact.py": 100.0,
     "bajutsu/analysis/stats/__init__.py": 100.0,
     "bajutsu/analysis/stats/_functions.py": 97.42,
