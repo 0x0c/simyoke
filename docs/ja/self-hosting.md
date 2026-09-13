@@ -491,9 +491,10 @@ jobs:
     steps:
       - name: OIDC トークンをマシンセッションと交換する
         run: |
-          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BAJUTSU_AUDIENCE" | jq -r .value)
-          curl -sS -c cookies.txt -X POST "$BAJUTSU_URL/api/oidc/exchange" \
+          set -o pipefail
+          token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BAJUTSU_AUDIENCE" | jq -er .value)
+          curl -sSf -c cookies.txt -X POST "$BAJUTSU_URL/api/oidc/exchange" \
             -H 'Content-Type: application/json' \
             -d "{\"token\": \"$token\", \"org\": \"acme\"}"
         env:
@@ -815,7 +816,7 @@ BE-0015 で今後の作業です。
 |---|---|
 | `GET /api/orgs` | 生存している org を、そのメンバーシップとともに一覧します。 |
 | `POST /api/orgs` | `{"slug": "...", "name": "..."}` から org を作ります。メンバーは**空**なので、メンバーシップを設定するまで誰もサインインできません。 |
-| `POST /api/orgs/<slug>/membership` | `{"members": [...], "githubOrgs": [...], "githubTeams": [...], "editorTeams": [...]}` を1つの単位として置き換えます。旧来の単数形 `editorTeam` を載せた body は 400 で拒否します。その body は `editorTeams` を挙げておらず、従えばその org の書き込み権限を消してしまうからです。 |
+| `POST /api/orgs/<slug>/membership` | `{"members": [...], "githubOrgs": [...], "githubTeams": [...], "editorTeams": [...]}` を1つの単位として置き換えます。`allowedRepositories` だけは例外です。キーを省くと、リポジトリの一覧はそのまま残ります。キーを明示したときだけ（`[]` も含めて）置き換えます。旧来の単数形 `editorTeam` を載せた body は 400 で拒否します。その body は `editorTeams` を挙げておらず、従えばその org の書き込み権限を消してしまうからです。 |
 | `DELETE /api/orgs/<slug>` | org を廃止し、その org としてセッションを持っている全員をサインアウトさせます。`default` は常に拒否します。 |
 
 4つとも監査ログに記録します。`default` は3つの変更操作すべてで予約されています。作成も、メンバーシップの置き換えも、廃止も、この slug に対しては拒否します。未一致のサインインが落ちる先の org であり、admin Team の迂回で入った admin も全員ここに入るからです。ここに実在のテナントを置けば、admin が復旧に使う名前空間を奪います。名簿を与える操作も同じことです。login をある org に置くのはメンバーシップだからです。ただし一覧には、フォールバックである旨を添えて**表示します**。迂回で入った admin 自身がここにいるので、隠すとその admin の run や secret や証跡がどこに落ちるかも見えなくなります。org の削除は soft delete です。サインインを受け付けなくなり一覧からも消え、同時に、そのメンバーがすでに持っているセッションもすべて失効します。廃止前に発行された cookie で、そのテナントとして振る舞い続ける人が残らないようにするためです。その org の run と監査記録は引き続き参照できます。admin の操作が取り上げるのはテナントの行動能力であって、そのテナントがすでに行ったことの記録ではないからです。slug も予約されたままなので、同じ名前で作り直すことはできません。

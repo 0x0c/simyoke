@@ -167,6 +167,10 @@ def update_org_membership(
 ) -> tuple[Any, int]:
     """Replace an org's ``{members, githubOrgs, githubTeams, editorTeams}`` as one unit.
 
+    ``allowedRepositories`` is the exception (BE-0414 unit 2): omitting the key leaves the machine
+    roster as it stands, and only an explicit list — ``[]`` included — replaces it, so a client
+    that predates the field cannot strip it and be told the update succeeded.
+
     The same granularity a configuration edit already had, rather than per-entry add/remove: an
     admin sees the whole roster and sends back the whole roster, so two concurrent edits can't
     interleave into a membership neither of them asked for. Takes effect on the next sign-in, like
@@ -208,7 +212,8 @@ def update_org_membership(
         # refusing costs: one request an operator can fix here, every login of the deployment there.
         # Loud rather than normalized, like `_validate_slug` above (determinism first).
         return {"error": "editorTeam is retired; send editorTeams as a list of Teams instead"}, 400
-    # Narrowed by the four error returns above.
+    # Narrowed by the four `_string_list` guards above. `allowed_repositories` is not asserted: None
+    # is its "leave the roster as it stands" value, not a validation failure the guard above caught.
     assert members is not None and github_orgs is not None
     assert github_teams is not None and editor_teams is not None
     if not state.repository.set_org_membership(

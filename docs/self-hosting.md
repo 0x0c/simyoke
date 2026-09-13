@@ -507,9 +507,10 @@ jobs:
     steps:
       - name: Exchange the OIDC token for a Bajutsu machine session
         run: |
-          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BAJUTSU_AUDIENCE" | jq -r .value)
-          curl -sS -c cookies.txt -X POST "$BAJUTSU_URL/api/oidc/exchange" \
+          set -o pipefail
+          token=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BAJUTSU_AUDIENCE" | jq -er .value)
+          curl -sSf -c cookies.txt -X POST "$BAJUTSU_URL/api/oidc/exchange" \
             -H 'Content-Type: application/json' \
             -d "{\"token\": \"$token\", \"org\": \"acme\"}"
         env:
@@ -590,10 +591,10 @@ would end that repository's concurrent pipelines too.
 > **Not yet wired.** Retiring an org revokes its *members'* sessions, not the machine sessions
 > bound to it, and there is no endpoint that revokes a repository's sessions on their own. Both
 > are BE-0414 unit 3. Until then a machine session lives out its `BAJUTSU_OIDC_SESSION_TTL`
-> whatever the operator does — which is inert while unit 3's allowlist is absent and every machine
-> session is refused everywhere, and is why the TTL is the bound that actually matters today. Keep
-> it short, and treat removing an `allowedRepositories` entry as stopping *new* sessions rather
-> than ending live ones.
+> whatever the operator does. That costs nothing today, since unit 3's endpoint allowlist is absent and
+> every machine session is refused on every endpoint — but the TTL is still the only bound on such
+> a session's life, so keep it short, and treat removing an `allowedRepositories` entry as
+> stopping *new* sessions rather than ending live ones.
 
 ### Operator secrets (the Claude API key)
 
@@ -840,7 +841,7 @@ An **Orgs** page appears in the web UI for admins, backed by four admin-only end
 |---|---|
 | `GET /api/orgs` | List every live org with its membership. |
 | `POST /api/orgs` | Create an org from `{"slug": "...", "name": "..."}`, with **no** members — so it admits nobody until you set its membership. |
-| `POST /api/orgs/<slug>/membership` | Replace `{"members": [...], "githubOrgs": [...], "githubTeams": [...], "editorTeams": [...]}` as one unit. A body still carrying the retired singular `editorTeam` is refused with a 400: it names no `editorTeams`, and obeying it would strip the org's write access. |
+| `POST /api/orgs/<slug>/membership` | Replace `{"members": [...], "githubOrgs": [...], "githubTeams": [...], "editorTeams": [...]}` as one unit. `allowedRepositories` is the exception: omitting the key leaves the machine roster untouched, and only an explicit list — `[]` included — replaces it. A body still carrying the retired singular `editorTeam` is refused with a 400: it names no `editorTeams`, and obeying it would strip the org's write access. |
 | `DELETE /api/orgs/<slug>` | Retire an org. Refused outright for `default`. |
 
 The audit log records every one of the four. `default` is reserved on all three mutations — created,
