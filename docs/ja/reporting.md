@@ -31,6 +31,8 @@ runs/<runId>/
 `runId` は `YYYYMMDD-HHMMSS` の形式で、`bajutsu/common/run_meta/id.py`（[BE-0200](../../roadmaps/BE-0200-run-id-contract/BE-0200-run-id-contract-ja.md)）が一箇所で採番します。この形式は report、Web UI、その他すべての呼び出し元で共有する単一の契約です。`sid` は `{NN}-{slug}` の形式で、ゼロ埋めされた実行順の連番と、シナリオを読み込んだ元ファイルの語幹（`login_flow.yaml` なら `login_flow`）をつなげたものです。ファイルから読み込まれていないシナリオ（メモリ上で直接組み立てられたものなど、元ファイルが不明な場合）では、代わりにシナリオの `name:` フィールドをスラッグ化した値になります
 （[BE-0417](../../roadmaps/BE-0417-scenario-result-folder-naming/BE-0417-scenario-result-folder-naming-ja.md)）。`stepId` は `step.name` または `step<i>` です。
 
+スラッグは、元ファイルの語幹から作る場合も `name:` から作る場合も、60 文字に切り詰めます（[BE-0420](../../roadmaps/BE-0420-scenario-slug-length-cap/BE-0420-scenario-slug-length-cap-ja.md)）。元ファイルの語幹には Unicode の文字がそのまま残るため、上限はバイト数ではなく文字数で数えます。全角文字や日本語の名前は、1文字あたりのバイト数が多くなりがちです。American Standard Code for Information Interchange（ASCII）は、1文字を1バイトで表します。文字数で数えることで、日本語の名前も ASCII と同じ長さに切り詰められます。ファイル名や `name:` フィールドが上限を超えるシナリオも、最後まで実行できます。証跡ディレクトリの名前は、見分けのつく先頭部分だけになります。`Scenario.name` 自体は切り詰めないので、`manifest.json` と `report.html` には元の名前がそのまま残ります。切り詰めた結果スラッグが一致する2つのシナリオも、`runs/<runId>/<sid>/` がスラッグの前に置く実行順の連番で区別できます。
+
 ## manifest.json
 
 `RunResult` 以下はすべて dataclass なので、`manifest_dict` でステップ / expect の結果がそのまま落ちます。ただし`wall_offset_s`は例外です（詳細は後述）。これは run 内だけで使う変換定数であり、永続化後は意味を持たないため除外されます。それ以外のタイムスタンプはすべて絶対的な実時刻（エポック秒）なので、記録した run のプロセスが終了したあとも同じ意味を保ちます（[evidence](evidence.md#区間証跡video--devicelog--apptrace)参照）。
